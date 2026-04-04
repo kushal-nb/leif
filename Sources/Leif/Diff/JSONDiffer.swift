@@ -392,7 +392,7 @@ enum JSONDiffer {
 
     static func scalarString(_ v: Any) -> String {
         switch v {
-        case let s as String: return "\"\(s)\""
+        case let s as String: return "\"\(escapeJSONString(s))\""
         case let n as NSNumber:
             if n === kCFBooleanTrue  { return "true"  }
             if n === kCFBooleanFalse { return "false" }
@@ -408,6 +408,28 @@ enum JSONDiffer {
             return "[…]"
         default: return "\(v)"
         }
+    }
+
+    /// Escapes special characters in a string for valid JSON representation.
+    private static func escapeJSONString(_ s: String) -> String {
+        var out = ""
+        out.reserveCapacity(s.count)
+        for ch in s {
+            switch ch {
+            case "\\": out += "\\\\"
+            case "\"": out += "\\\""
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            default:
+                if ch.asciiValue.map({ $0 < 0x20 }) == true {
+                    out += String(format: "\\u%04x", ch.asciiValue!)
+                } else {
+                    out.append(ch)
+                }
+            }
+        }
+        return out
     }
 
     // MARK: UUID field detection

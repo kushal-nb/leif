@@ -655,17 +655,20 @@ struct ReadOnlyCodeView: NSViewRepresentable {
         guard let tv = scroll.documentView as? NSTextView else { return }
         guard context.coordinator.detectChanges(base: text, search: searchText, index: matchIndex) != nil else { return }
 
+        // Apply syntax coloring if the content looks like JSON.
+        // highlight() auto-selects fast O(n) path for large payloads.
+        let trimmedFirst = text.trimmingCharacters(in: .whitespacesAndNewlines).first
+        let looksLikeJSON = trimmedFirst == "{" || trimmedFirst == "["
+
         if searchText.isEmpty {
-            let attrStr = NSAttributedString(string: text, attributes: [
-                .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
-                .foregroundColor: NSColor.labelColor
-            ])
+            let attrStr = looksLikeJSON
+                ? JSONHighlighter.highlight(text)
+                : JSONHighlighter.plainMonospace(text)
             tv.textStorage?.setAttributedString(attrStr)
         } else {
-            let base = NSMutableAttributedString(string: text, attributes: [
-                .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
-                .foregroundColor: NSColor.labelColor
-            ])
+            let base = looksLikeJSON
+                ? (JSONHighlighter.highlight(text).mutableCopy() as! NSMutableAttributedString)
+                : (JSONHighlighter.plainMonospace(text).mutableCopy() as! NSMutableAttributedString)
             tv.textStorage?.setAttributedString(JSONHighlighter.addSearchHighlights(base, search: searchText))
         }
 
@@ -708,26 +711,30 @@ struct SyntaxHighlightedJSONView: NSViewRepresentable {
 // MARK: - JSON syntax highlighter (runs on background thread, result is cached)
 
 enum JSONHighlighter {
-    // Dynamic colors — resolve correctly for both light and dark mode at draw time
-    private static let numberColor = NSColor(name: nil) { t in
-        t.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? .systemBlue
-            : NSColor(calibratedRed: 0.0,  green: 0.22, blue: 0.72, alpha: 1)
-    }
-    private static let boolColor = NSColor(name: nil) { t in
-        t.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? .systemOrange
-            : NSColor(calibratedRed: 0.60, green: 0.27, blue: 0.0,  alpha: 1)
-    }
-    private static let stringColor = NSColor(name: nil) { t in
-        t.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? NSColor(calibratedRed: 0.35, green: 0.85, blue: 0.40, alpha: 0.9)
-            : NSColor(calibratedRed: 0.05, green: 0.45, blue: 0.12, alpha: 1)
-    }
+    // Dynamic colors — matching the diff view's rich color scheme.
+    // Keys: sky blue (dark) / royal blue (light)
     private static let keyColor = NSColor(name: nil) { t in
         t.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? .systemTeal
-            : NSColor(calibratedRed: 0.0,  green: 0.38, blue: 0.48, alpha: 1)
+            ? NSColor(calibratedRed: 0.40, green: 0.80, blue: 1.00, alpha: 1)
+            : NSColor(calibratedRed: 0.00, green: 0.32, blue: 0.80, alpha: 1)
+    }
+    // Strings: amber (dark) / burnt orange (light)
+    private static let stringColor = NSColor(name: nil) { t in
+        t.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(calibratedRed: 0.92, green: 0.65, blue: 0.35, alpha: 1)
+            : NSColor(calibratedRed: 0.62, green: 0.22, blue: 0.00, alpha: 1)
+    }
+    // Numbers: lime (dark) / forest green (light)
+    private static let numberColor = NSColor(name: nil) { t in
+        t.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(calibratedRed: 0.65, green: 0.92, blue: 0.48, alpha: 1)
+            : NSColor(calibratedRed: 0.06, green: 0.44, blue: 0.06, alpha: 1)
+    }
+    // Booleans: lavender (dark) / deep purple (light)
+    private static let boolColor = NSColor(name: nil) { t in
+        t.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(calibratedRed: 0.82, green: 0.52, blue: 0.98, alpha: 1)
+            : NSColor(calibratedRed: 0.48, green: 0.08, blue: 0.72, alpha: 1)
     }
 
     private static let numberRegex = try! NSRegularExpression(pattern: #"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?"#)
@@ -736,7 +743,7 @@ enum JSONHighlighter {
     private static let stringRegex = try! NSRegularExpression(pattern: #""(?:[^"\\]|\\.)*""#)
     private static let keyRegex    = try! NSRegularExpression(pattern: #""(?:[^"\\]|\\.)*"(?=\s*:)"#)
 
-    /// Monospace body text without regex passes — used for multi‑MB JSON strings.
+    /// Monospace body text without any coloring.
     static func plainMonospace(_ text: String) -> NSAttributedString {
         let ms = NSMutableAttributedString(string: text)
         let font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
@@ -746,7 +753,13 @@ enum JSONHighlighter {
         return ms.copy() as! NSAttributedString
     }
 
+    /// Syntax highlight — uses regex for small payloads, fast char-by-char for large ones.
     static func highlight(_ text: String) -> NSAttributedString {
+        // For payloads > 384KB, use the fast O(n) char-by-char highlighter (same as diff view).
+        // Regex is 5 full-text passes — too slow for multi-MB strings.
+        if text.utf8.count >= 384_000 {
+            return highlightFast(text)
+        }
         let ms = NSMutableAttributedString(string: text)
         let font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
         let whole = NSRange(text.startIndex..., in: text)
@@ -761,6 +774,72 @@ enum JSONHighlighter {
         apply(keyRegex,    color: keyColor,    to: ms, in: text)
 
         return ms.copy() as! NSAttributedString
+    }
+
+    /// Fast O(n) syntax highlighter — single pass, char-by-char, no regex.
+    /// Works on any payload size including multi-MB. Same approach as the diff view.
+    static func highlightFast(_ text: String) -> NSAttributedString {
+        let font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        let ms = NSMutableAttributedString(string: text, attributes: [
+            .font: font, .foregroundColor: NSColor.labelColor
+        ])
+        let ns = text as NSString
+        let len = ns.length
+        var pos = 0
+
+        while pos < len {
+            var lineEnd = pos, contentsEnd = pos
+            ns.getLineStart(nil, end: &lineEnd, contentsEnd: &contentsEnd,
+                            for: NSRange(location: pos, length: 0))
+            let ce = contentsEnd
+
+            var p = pos
+            while p < ce && ns.character(at: p) == 32 { p += 1 }
+            guard p < ce else { pos = lineEnd > pos ? lineEnd : len; continue }
+
+            let c0 = ns.character(at: p)
+            if c0 == 34 { // '"'
+                let qStart = p; p += 1
+                while p < ce {
+                    let c = ns.character(at: p)
+                    if c == 92 { p = min(p + 2, ce); continue }
+                    if c == 34 { p += 1; break }
+                    p += 1
+                }
+                let qEnd = p
+                var q = p
+                while q < ce && ns.character(at: q) == 32 { q += 1 }
+                if q < ce && ns.character(at: q) == 58 { // ':'
+                    ms.addAttribute(.foregroundColor, value: keyColor,
+                                    range: NSRange(location: qStart, length: qEnd - qStart))
+                    q += 1
+                    while q < ce && ns.character(at: q) == 32 { q += 1 }
+                    colorValueFast(ms, ns: ns, s: q, e: ce)
+                } else {
+                    ms.addAttribute(.foregroundColor, value: stringColor,
+                                    range: NSRange(location: qStart, length: qEnd - qStart))
+                }
+            } else if c0 != 123 && c0 != 125 && c0 != 91 && c0 != 93 {
+                colorValueFast(ms, ns: ns, s: p, e: ce)
+            }
+            pos = lineEnd > pos ? lineEnd : len
+        }
+        return ms.copy() as! NSAttributedString
+    }
+
+    private static func colorValueFast(_ ms: NSMutableAttributedString, ns: NSString, s: Int, e: Int) {
+        guard s < e else { return }
+        var end = e
+        while end > s { let c = ns.character(at: end - 1); if c == 44 || c == 32 { end -= 1 } else { break } }
+        guard end > s else { return }
+        let r = NSRange(location: s, length: end - s)
+        switch ns.character(at: s) {
+        case 34:            ms.addAttribute(.foregroundColor, value: stringColor, range: r)
+        case 116, 102:      ms.addAttribute(.foregroundColor, value: boolColor,   range: r)
+        case 110:           ms.addAttribute(.foregroundColor, value: NSColor.tertiaryLabelColor, range: r)
+        case 123, 125, 91, 93: break
+        default:            ms.addAttribute(.foregroundColor, value: numberColor, range: r)
+        }
     }
 
     /// Applies case-insensitive search highlight on top of an existing attributed string.

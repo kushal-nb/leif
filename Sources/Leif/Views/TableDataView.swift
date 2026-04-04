@@ -126,9 +126,14 @@ struct TablePayloadView: View {
 
     // MARK: - Copy TSV to clipboard
     private func copyTSV(_ af: ArrayField) {
-        var lines = [af.columns.joined(separator: "\t")]
+        func escapeTSV(_ s: String) -> String {
+            s.replacingOccurrences(of: "\t", with: "\\t")
+             .replacingOccurrences(of: "\n", with: "\\n")
+             .replacingOccurrences(of: "\r", with: "\\r")
+        }
+        var lines = [af.columns.map(escapeTSV).joined(separator: "\t")]
         for row in af.rows {
-            let values = af.columns.map { cellString(row[$0]) }
+            let values = af.columns.map { escapeTSV(cellString(row[$0])) }
             lines.append(values.joined(separator: "\t"))
         }
         NSPasteboard.general.clearContents()
@@ -312,6 +317,7 @@ struct DynamicTableView: NSViewRepresentable {
                 cell.textColor      = NSColor.tertiaryLabelColor
                 cell.drawsBackground = false
             } else {
+                guard row < rows.count else { return cell }
                 let value = rows[row][colID]
                 let str   = cellString(value)
                 cell.stringValue = str
@@ -382,7 +388,8 @@ final class ReorderableTableView: NSTableView {
 
     @objc private func copyRow(_ sender: NSMenuItem) {
         guard let rowNum = (sender.representedObject as? NSNumber)?.intValue,
-              let ds = dataSource as? DynamicTableView.Coordinator else { return }
+              let ds = dataSource as? DynamicTableView.Coordinator,
+              rowNum >= 0, rowNum < ds.rows.count else { return }
         let row = ds.rows[rowNum]
         let vals = ds.columns.map { cellString(row[$0]) }
         NSPasteboard.general.clearContents()

@@ -17,11 +17,13 @@ struct ContentView: View {
 
     private func convertUnix(_ raw: String) -> String? {
         let t = raw.trimmingCharacters(in: .whitespaces)
-        guard !t.isEmpty, let value = Double(t) else { return nil }
-        let seconds = value > 1e10 ? value / 1000.0 : value
+        guard !t.isEmpty, let value = Double(t), value.isFinite else { return nil }
+        let seconds = abs(value) > 1e10 ? value / 1000.0 : value
+        // Reject timestamps outside reasonable range (year 0001 to 9999)
+        guard seconds >= -62135596800 && seconds <= 253402300799 else { return nil }
         let fmt = ISO8601DateFormatter()
         fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        fmt.timeZone = TimeZone(identifier: "UTC")
+        fmt.timeZone = TimeZone(abbreviation: "UTC")!
         return fmt.string(from: Date(timeIntervalSince1970: seconds))
     }
 
@@ -29,7 +31,7 @@ struct ContentView: View {
         HSplitView {
             inputPanel
                 .frame(minWidth: 360, idealWidth: 420, maxWidth: 520)
-                // Stronger vertical divider — overlay a stripe on the trailing edge
+                // Stronger vertical divider - overlay a stripe on the trailing edge
                 .overlay(alignment: .trailing) {
                     Rectangle()
                         .fill(colorScheme == .dark
@@ -151,8 +153,11 @@ struct ContentView: View {
 
             panelDivider
 
-            // Unix → UTC converter
-            unixConverterPanel
+            // Unix → UTC converter — compact rows, scrolls when exceeding 2 rows
+            ScrollView(.vertical, showsIndicators: true) {
+                unixConverterPanel
+            }
+            .frame(maxHeight: 70)
         }
     }
 
@@ -235,133 +240,79 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Unix → UTC converter panel
+    // MARK: - Unix → UTC converter panel — compact inline rows
     private var unixConverterPanel: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                HStack(spacing: 5) {
-                    Image(systemName: "clock.arrow.2.circlepath")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.primary)
-                    Text("Unix → UTC")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.primary)
-                }
-                Spacer(minLength: 8)
-                Button {
-                    withAnimation(.spring(response: 0.34, dampingFraction: 0.82)) {
-                        unixEntries.append(UnixEntry())
-                    }
-                } label: {
-                    Label("Add row", systemImage: "plus")
-                        .font(.system(size: 10, weight: .semibold))
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .tint(.accentColor)
-                .help("Add another timestamp row")
-            }
-
-            // Use ForEach($unixEntries) — not enumerated() + manual Bindings. The latter can trip
-            // SwiftUI’s indexed Binding path during animated inserts/removes (Array subscript trap on main thread).
-            VStack(alignment: .leading, spacing: 10) {
-                ForEach($unixEntries) { $entry in
-                    UnixTimestampRow(
-                        note: $entry.note,
-                        input: $entry.input,
-                        showRemove: unixEntries.count > 1,
-                        convert: convertUnix,
-                        onRemove: {
-                            withAnimation(.spring(response: 0.32, dampingFraction: 0.84)) {
-                                unixEntries.removeAll { $0.id == entry.id }
-                            }
-                        }
-                    )
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-                }
-            }
-            .animation(.spring(response: 0.36, dampingFraction: 0.82), value: unixEntries.map(\.id))
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(Color(nsColor: .controlBackgroundColor))
-    }
-
-    /// One row: note + Unix side by side, UTC + remove on the right (compact).
-    private struct UnixTimestampRow: View {
-        @Binding var note: String
-        @Binding var input: String
-        let showRemove: Bool
-        let convert: (String) -> String?
-        let onRemove: () -> Void
-        @Environment(\.colorScheme) private var colorScheme
-
-        private var utc: String? { convert(input) }
-
-        /// Soft pink wash behind the two editable fields so they read as one “type here” zone.
-        private var inputWellFill: Color {
-            colorScheme == .dark
-                ? Color.pink.opacity(0.16)
-                : Color.pink.opacity(0.11)
-        }
-
-        private var inputWellStroke: Color {
-            Color.pink.opacity(colorScheme == .dark ? 0.38 : 0.28)
-        }
-
-        var body: some View {
-            HStack(alignment: .center, spacing: 8) {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(Array(unixEntries.enumerated()), id: \.element.id) { idx, entry in
                 HStack(spacing: 6) {
-                    TextField("Note (optional)", text: $note)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 11))
-                        .frame(minWidth: 72, idealWidth: 120, maxWidth: 160, alignment: .leading)
-                        .help("Not converted — only helps you remember this row later.")
+                    if idx == 0 {
+                        Image(systemName: "clock.arrow.2.circlepath")
+                            .font(.system(size: 9))
+                            .foregroundColor(.secondary)
+                    }
+                    TextField("note", text: Binding(
+                        get: { unixEntries[safe: idx]?.note ?? "" },
+                        set: { if idx < unixEntries.count { unixEntries[idx].note = $0 } }
+                    ))
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 10))
+                    .frame(width: 80)
 
-                    TextField("Unix s/ms", text: $input)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 11, design: .monospaced))
-                        .frame(width: 108, alignment: .leading)
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 6)
-                .background(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(inputWellFill)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(inputWellStroke, lineWidth: 1)
-                )
+                    TextField("unix s/ms", text: Binding(
+                        get: { unixEntries[safe: idx]?.input ?? "" },
+                        set: { if idx < unixEntries.count { unixEntries[idx].input = $0 } }
+                    ))
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 10, design: .monospaced))
+                    .frame(width: 100)
 
-                Group {
-                    if let t = utc {
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: 8))
+                        .foregroundColor(.secondary)
+
+                    if let t = convertUnix(entry.input) {
                         Text(t)
-                            .font(.system(size: 10, design: .monospaced))
+                            .font(.system(size: 9, design: .monospaced))
                             .foregroundColor(.secondary)
                             .textSelection(.enabled)
                             .lineLimit(1)
-                            .minimumScaleFactor(0.75)
-                            .transition(.opacity)
                     } else {
-                        Text("—")
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundColor(.secondary.opacity(0.4))
+                        Text("-")
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundColor(.secondary.opacity(0.3))
                     }
-                }
-                .frame(minWidth: 96, maxWidth: .infinity, alignment: .leading)
-
-                if showRemove {
-                    Button(action: onRemove) {
-                        Image(systemName: "minus.circle")
-                            .font(.system(size: 14))
-                            .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    if unixEntries.count > 1 {
+                        Button {
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                unixEntries.removeAll { $0.id == entry.id }
+                            }
+                        } label: {
+                            Image(systemName: "minus.circle")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
-                    .help("Remove row")
+                    if idx == unixEntries.count - 1 {
+                        Button {
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                unixEntries.append(UnixEntry())
+                            }
+                        } label: {
+                            Label("Add", systemImage: "plus")
+                                .font(.system(size: 10, weight: .medium))
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .help("Add another timestamp row")
+                    }
                 }
             }
         }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Color(nsColor: .controlBackgroundColor))
     }
 }
 

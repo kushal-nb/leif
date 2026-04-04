@@ -84,7 +84,8 @@ enum GoStructParser {
         pattern: #"(?:^| )([A-Za-z][A-Za-z0-9_]*):"#)
 
     /// Returns [String: Any] for a Go struct string, nil if it doesn't look like one.
-    static func parse(_ raw: String) -> [String: Any]? {
+    static func parse(_ raw: String, depth: Int = 0) -> [String: Any]? {
+        guard depth < 32 else { return nil }
         var s = raw.trimmingCharacters(in: .whitespaces)
         if s.hasPrefix("&") { s = String(s.dropFirst()) }
         guard s.hasPrefix("{") && s.hasSuffix("}") && s.count > 2 else { return nil }
@@ -106,21 +107,21 @@ enum GoStructParser {
             let raw = ns.substring(with: NSRange(location: valueStart,
                                                   length: valueEnd - valueStart))
                 .trimmingCharacters(in: .whitespaces)
-            result[key] = coerce(raw)
+            result[key] = coerce(raw, depth: depth)
         }
         return result.isEmpty ? nil : result
     }
 
     /// Best-effort type coercion for a Go fmt value string.
-    private static func coerce(_ s: String) -> Any {
+    private static func coerce(_ s: String, depth: Int) -> Any {
         if s == "<nil>" || s == "nil" { return NSNull() }
         if s == "true"  { return true  }
         if s == "false" { return false }
         if let n = Int(s)    { return n }
         if let n = Double(s) { return n }
-        // Nested &{...} or {...} — recurse
+        // Nested &{...} or {...} — recurse with depth limit
         if s.hasPrefix("&{") || (s.hasPrefix("{") && !s.contains("\"")) {
-            if let nested = parse(s) { return nested }
+            if let nested = parse(s, depth: depth + 1) { return nested }
         }
         return s
     }

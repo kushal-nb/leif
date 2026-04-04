@@ -73,7 +73,7 @@ struct LogListView: View {
                 }
                 return out
             }.value
-            guard let result = maybe else { return }
+            guard let result = maybe, !Task.isCancelled else { return }
             filteredEntries = result
         }
         // Clear diff mark when a completely new parse is loaded
@@ -161,10 +161,7 @@ struct LogListView: View {
             Image(systemName: "magnifyingglass")
                 .foregroundColor(.secondary)
                 .font(.system(size: 12))
-            TextField("Search… (max \(LeifSearchLimits.listFilter) chars)", text: Binding(
-                get: { filterText },
-                set: { filterText = $0.leifClampedSearch(maxLength: LeifSearchLimits.listFilter) }
-            ))
+            TextField("Search…", text: $filterText)
                 .textFieldStyle(.plain)
                 .font(.system(size: 12))
                 .focused($searchFocused)

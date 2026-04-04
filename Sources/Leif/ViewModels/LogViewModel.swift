@@ -19,8 +19,8 @@ func buildEntryPayload(_ entry: LogEntry) async -> PayloadCache.Built? {
 
             let pp = JSONFormatter.prettyPrint(dict)
 
-            let skipSyntaxColor = heavy || pp.utf8.count >= PayloadBuildLimits.heavyRawUTF8
-            let hl = skipSyntaxColor ? JSONHighlighter.plainMonospace(pp) : JSONHighlighter.highlight(pp)
+            // highlight() auto-selects: regex for small payloads, fast O(n) char-by-char for large.
+            let hl = JSONHighlighter.highlight(pp)
 
             let nodes: [JSONNode]
             let treeNote: String?
@@ -55,6 +55,7 @@ final class PayloadCache {
     }
 
     private static let maxEntries = 200
+    private let lock = NSLock()
     private var store: [UUID: Built] = [:]
     /// Doubly-linked list node for O(1) LRU tracking.
     private final class Node {
@@ -68,15 +69,23 @@ final class PayloadCache {
     private var tail: Node?   // oldest
 
     /// O(1) existence check — does not touch access order.
-    func has(_ id: UUID) -> Bool { store[id] != nil }
+    func has(_ id: UUID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return store[id] != nil
+    }
 
     func get(_ id: UUID) -> Built? {
+        lock.lock()
+        defer { lock.unlock() }
         guard let built = store[id] else { return nil }
         moveToHead(id)
         return built
     }
 
     func set(_ id: UUID, _ built: Built) {
+        lock.lock()
+        defer { lock.unlock() }
         if store[id] != nil {
             moveToHead(id)
         } else {
@@ -93,6 +102,8 @@ final class PayloadCache {
     }
 
     func clear() {
+        lock.lock()
+        defer { lock.unlock() }
         store.removeAll()
         nodeMap.removeAll()
         head = nil
