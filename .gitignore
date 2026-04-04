@@ -1,0 +1,46 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# Swift Package Manager
+.build/
+.swiftpm/configuration/
+.swiftpm/xcode/
+Package.resolved
+
+# Xcode (if you add a project later)
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+DerivedData/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+
+# App build output (from build-app.sh)
+dist/
+*.app
+
+# Local scratch / pasted logs (root file used for testing)
+/text
+
+# Editors & tooling
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+.netrc
+
+# CI / coverage (if added later)
+.coverage
+*.profraw
