@@ -3,9 +3,6 @@ import AppKit
 
 // MARK: - Escape-aware window
 
-/// Pressing Escape closes the diff window.
-/// (If a search field is focused, SwiftUI unfocuses it on the first Escape;
-///  the second Escape reaches this override and closes.)
 private final class EscapeClosingWindow: NSWindow {
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 { close() }
@@ -21,28 +18,21 @@ final class DiffWindowController {
 
     func show(left: LogEntry, right: LogEntry, isDark: Bool) {
         let hosting = NSHostingController(rootView: DiffView(left: left, right: right))
-        // Empty sizingOptions: NSHostingView fills whatever frame the window gives it.
-        // [.minSize/.maxSize] would pin the view to its intrinsic size and break zoom.
         hosting.sizingOptions = []
-
         if window == nil {
             let win = EscapeClosingWindow(contentViewController: hosting)
             win.title = "JSON Diff"
             win.styleMask = [.titled, .closable, .resizable, .miniaturizable]
             win.isReleasedWhenClosed = false
             win.minSize = NSSize(width: 900, height: 560)
-            // Open at 82 % of the screen's usable area, capped at a comfortable max.
             let avail = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
                         ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-            let w = max(900,  min(1480, avail.width  * 0.82)).rounded()
-            let h = max(560,  min(960,  avail.height * 0.82)).rounded()
+            let w = max(900, min(1480, avail.width * 0.82)).rounded()
+            let h = max(560, min(960, avail.height * 0.82)).rounded()
             win.setContentSize(NSSize(width: w, height: h))
             win.center()
             self.window = win
-        } else {
-            window!.contentViewController = hosting
-        }
-
+        } else { window!.contentViewController = hosting }
         guard let win = window else { return }
         win.appearance = NSAppearance(named: isDark ? .darkAqua : .aqua)
         win.makeKeyAndOrderFront(nil)
@@ -50,68 +40,52 @@ final class DiffWindowController {
     }
 }
 
-// MARK: - Diff state
+// MARK: - Models
+
+private struct DiffResult {
+    let leftAttr: NSAttributedString
+    let rightAttr: NSAttributedString
+    let summary: String
+    /// Row indices (0-based into aligned lines) where changes occur — for navigation.
+    let changeIndices: [Int]
+}
 
 private enum DiffState {
-    case computing
-    case noPayload
-    case identical
-    /// summary is nil when the payload exceeded the structural-diff threshold.
-    case sideBySide(leftJSON: String, rightJSON: String,
-                    summary: String?, changes: [DiffRow])
+    case computing, noPayload, identical
+    case ready(DiffResult)
 }
 
 // MARK: - Diff view
 
 struct DiffView: View {
-    let left:  LogEntry
+    let left: LogEntry
     let right: LogEntry
 
-    @State private var diffState      = DiffState.computing
+    @State private var diffState = DiffState.computing
     @State private var syncCoordinator = ScrollSyncCoordinator()
-    @State private var searchText     = ""
-    @FocusState private var searchFocused: Bool
+    @State private var currentChange = 0
     @Environment(\.colorScheme) var cs
 
-    /// Skip structural diff only for very large payloads (20 MB raw).
-    private let diffSizeLimit = 20_000_000
-
-    // MARK: Body
-
     var body: some View {
-        VStack(spacing: 0) {
-            topBar
-            Divider()
-            contentBody
-        }
-        // Fill the whole window; minWidth/minHeight matching window.minSize.
-        .frame(minWidth: 900, maxWidth: .infinity, minHeight: 560, maxHeight: .infinity)
-        // Hidden ⌘F shortcut — focuses global search field without fighting AppKit responders.
-        .background(
-            Button("") { searchFocused = true }
-                .keyboardShortcut("f", modifiers: .command)
+        VStack(spacing: 0) { topBar; Divider(); contentBody }
+            .frame(minWidth: 900, maxWidth: .infinity, minHeight: 560, maxHeight: .infinity)
+            .background(
+                Group {
+                    Button("") { navigateChange(delta: 1) }.keyboardShortcut(.downArrow, modifiers: .command)
+                    Button("") { navigateChange(delta: -1) }.keyboardShortcut(.upArrow, modifiers: .command)
+                }
                 .frame(width: 0, height: 0).opacity(0)
                 .allowsHitTesting(false).accessibilityHidden(true)
-        )
-        .task(id: "\(left.id)|\(right.id)") { await computeDiff() }
+            )
+            .task(id: "\(left.id)|\(right.id)") { await computeDiff() }
     }
 
-    // MARK: Content
-
-    @ViewBuilder
-    private var contentBody: some View {
+    @ViewBuilder private var contentBody: some View {
         switch diffState {
-        case .computing:
-            ProgressView("Computing diff…")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        case .noPayload:
-            statusMessage("One or both entries have no JSON payload to diff.",
-                          icon: "exclamationmark.triangle")
-        case .identical:
-            statusMessage("Entries are identical — no differences found.",
-                          icon: "checkmark.circle")
-        case .sideBySide(let lj, let rj, let summary, let changes):
-            sideBySideBody(leftJSON: lj, rightJSON: rj, summary: summary, changes: changes)
+        case .computing:  ProgressView("Computing diff…").frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .noPayload:  statusMsg("One or both entries have no JSON payload to diff.", icon: "exclamationmark.triangle")
+        case .identical:  statusMsg("Entries are identical — no differences found.", icon: "checkmark.circle")
+        case .ready(let r): sideBySide(r)
         }
     }
 
@@ -119,578 +93,372 @@ struct DiffView: View {
 
     private var topBar: some View {
         HStack(spacing: 0) {
-            entryCard(entry: left,  label: "A", accent: removedColor)
-                .frame(maxWidth: .infinity)
+            entryCard(entry: left, label: "A", accent: removedColor).frame(maxWidth: .infinity)
             Divider().frame(height: 40)
-            entryCard(entry: right, label: "B", accent: addedColor)
-                .frame(maxWidth: .infinity)
-        }
-        .frame(height: 40)
-        .background(Color(nsColor: .controlBackgroundColor))
+            entryCard(entry: right, label: "B", accent: addedColor).frame(maxWidth: .infinity)
+        }.frame(height: 40).background(Color(nsColor: .controlBackgroundColor))
     }
 
     private func entryCard(entry: LogEntry, label: String, accent: Color) -> some View {
         HStack(spacing: 6) {
-            Text(label)
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
+            Text(label).font(.system(size: 10, weight: .bold, design: .monospaced))
                 .padding(.horizontal, 5).padding(.vertical, 2)
                 .background(accent.opacity(cs == .dark ? 0.28 : 0.14))
-                .foregroundColor(accent)
-                .clipShape(RoundedRectangle(cornerRadius: 3))
+                .foregroundColor(accent).clipShape(RoundedRectangle(cornerRadius: 3))
             LevelBadge(level: entry.level)
             if !entry.displayTimestamp.isEmpty {
-                Text(entry.displayTimestamp)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundColor(.secondary)
+                Text(entry.displayTimestamp).font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary)
             }
-            Text(entry.message)
-                .font(.system(size: 11, weight: .medium))
-                .lineLimit(1).foregroundColor(.primary)
+            Text(entry.message).font(.system(size: 11, weight: .medium)).lineLimit(1).foregroundColor(.primary)
             Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 10)
+        }.padding(.horizontal, 10)
     }
 
-    // MARK: Side-by-side layout
+    // MARK: Side-by-side
 
-    @ViewBuilder
-    private func sideBySideBody(leftJSON: String, rightJSON: String,
-                                summary: String?, changes: [DiffRow]) -> some View {
+    @ViewBuilder private func sideBySide(_ r: DiffResult) -> some View {
         VStack(spacing: 0) {
-            infoBar(summary: summary)
+            infoBar(summary: r.summary, changeCount: r.changeIndices.count)
             Divider()
             HStack(spacing: 0) {
-                diffColumn(title: "A  —  before", titleColor: removedColor,
-                           json: leftJSON, isLeft: true, changes: changes)
-                Divider()
-                diffColumn(title: "B  —  after", titleColor: addedColor,
-                           json: rightJSON, isLeft: false, changes: changes)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                DiffTextView(attrText: r.leftAttr, syncCoord: syncCoordinator, isLeft: true)
+                Rectangle().fill(Color(nsColor: .separatorColor)).frame(width: 1)
+                DiffTextView(attrText: r.rightAttr, syncCoord: syncCoordinator, isLeft: false)
+            }.frame(maxWidth: .infinity, maxHeight: .infinity)
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    // Summary strip + global ⌘F search
-    private func infoBar(summary: String?) -> some View {
+    private func infoBar(summary: String, changeCount: Int) -> some View {
         HStack(spacing: 8) {
-            if let summary {
-                Image(systemName: "arrow.left.arrow.right")
-                    .font(.system(size: 10)).foregroundColor(.secondary)
-                Text(summary)
-                    .font(.system(size: 10)).foregroundColor(.secondary)
-            } else {
-                Image(systemName: "exclamationmark.circle")
-                    .font(.system(size: 10)).foregroundColor(.secondary)
-                Text("Payload too large for structural diff — showing formatted JSON.")
-                    .font(.system(size: 10)).foregroundColor(.secondary)
-            }
+            Image(systemName: "arrow.left.arrow.right").font(.system(size: 10)).foregroundColor(.secondary)
+            Text(summary).font(.system(size: 10)).foregroundColor(.secondary).lineLimit(1)
             Spacer(minLength: 0)
-            HStack(spacing: 4) {
-                Image(systemName: searchText.isEmpty
-                      ? "magnifyingglass" : "magnifyingglass.circle.fill")
-                    .font(.system(size: 10))
-                    .foregroundColor(searchText.isEmpty ? .secondary : .accentColor)
-                TextField("Search both columns  (⌘F)", text: $searchText)
-                    .font(.system(size: 11))
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 220)
-                    .focused($searchFocused)
-                if !searchText.isEmpty {
-                    Button { searchText = "" } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 10)).foregroundColor(.secondary)
-                    }
-                    .buttonStyle(.plain)
+            if changeCount > 0 {
+                HStack(spacing: 3) {
+                    Button(action: { navigateChange(delta: -1) }) {
+                        Image(systemName: "chevron.up").font(.system(size: 9, weight: .bold))
+                    }.buttonStyle(.plain).foregroundColor(.secondary).help("Previous change (Cmd+Up)")
+                    Text("\(min(currentChange + 1, changeCount))/\(changeCount)")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundColor(.primary).frame(minWidth: 36)
+                    Button(action: { navigateChange(delta: 1) }) {
+                        Image(systemName: "chevron.down").font(.system(size: 9, weight: .bold))
+                    }.buttonStyle(.plain).foregroundColor(.secondary).help("Next change (Cmd+Down)")
                 }
+                .padding(.horizontal, 6).padding(.vertical, 3)
+                .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color(nsColor: .controlBackgroundColor)))
+                .overlay(RoundedRectangle(cornerRadius: 5, style: .continuous).stroke(Color(nsColor: .separatorColor), lineWidth: 0.5))
             }
-            Text("Esc  ·  close").font(.system(size: 10)).foregroundColor(.secondary.opacity(0.45))
-        }
-        .padding(.horizontal, 12).padding(.vertical, 6)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.7))
-    }
-
-    private func diffColumn(title: String, titleColor: Color,
-                            json: String, isLeft: Bool, changes: [DiffRow]) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(title)
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundColor(titleColor.opacity(0.85))
-                .padding(.horizontal, 10).padding(.vertical, 5)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
-            Divider()
-            DiffTextView(text: json, syncCoord: syncCoordinator,
-                         isLeft: isLeft, changes: changes,
-                         isDark: cs == .dark, searchText: searchText)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Text("Cmd+F search  |  Esc close").font(.system(size: 10)).foregroundColor(.secondary.opacity(0.45))
+        }.padding(.horizontal, 12).padding(.vertical, 6).background(Color(nsColor: .controlBackgroundColor).opacity(0.7))
     }
 
     // MARK: Colors
 
-    private var addedColor: Color {
-        cs == .dark
-            ? Color(red: 0.28, green: 0.90, blue: 0.50)
-            : Color(red: 0.06, green: 0.52, blue: 0.22)
-    }
-    private var removedColor: Color {
-        cs == .dark
-            ? Color(red: 1.00, green: 0.38, blue: 0.38)
-            : Color(red: 0.75, green: 0.10, blue: 0.10)
+    private var addedColor: Color { cs == .dark ? Color(red: 0.28, green: 0.90, blue: 0.50) : Color(red: 0.06, green: 0.52, blue: 0.22) }
+    private var removedColor: Color { cs == .dark ? Color(red: 1.00, green: 0.38, blue: 0.38) : Color(red: 0.75, green: 0.10, blue: 0.10) }
+
+    // MARK: Navigation
+
+    private func navigateChange(delta: Int) {
+        guard case .ready(let r) = diffState, !r.changeIndices.isEmpty else { return }
+        currentChange = (currentChange + delta + r.changeIndices.count) % r.changeIndices.count
+        syncCoordinator.jumpToRow(r.changeIndices[currentChange])
     }
 
-    // MARK: Helpers
-
-    private func statusMessage(_ msg: String, icon: String) -> some View {
+    private func statusMsg(_ msg: String, icon: String) -> some View {
         VStack(spacing: 10) {
-            Image(systemName: icon)
-                .font(.system(size: 28)).foregroundColor(.secondary.opacity(0.5))
+            Image(systemName: icon).font(.system(size: 28)).foregroundColor(.secondary.opacity(0.5))
             Text(msg).foregroundColor(.secondary).font(.system(size: 13))
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    // MARK: Compute diff
+    // MARK: Compute diff — all heavy work in background
 
     private func computeDiff() async {
-        guard let lf = left.fields, let rf = right.fields else {
-            diffState = .noPayload; return
-        }
+        guard let lf = left.fields, let rf = right.fields else { diffState = .noPayload; return }
         let lDict = Dictionary(uniqueKeysWithValues: lf.pairs.map { ($0.key, $0.value) })
         let rDict = Dictionary(uniqueKeysWithValues: rf.pairs.map { ($0.key, $0.value) })
+        if (lDict as NSDictionary).isEqual(to: rDict as NSDictionary) { diffState = .identical; return }
 
-        // Fast identity check
-        if (lDict as NSDictionary).isEqual(to: rDict as NSDictionary) {
-            diffState = .identical; return
-        }
+        let isDark = cs == .dark
+        let result = await Task.detached(priority: .userInitiated) { () -> DiffResult? in
+            // Pretty-print both sides
+            let leftJSON = JSONFormatter.prettyPrint(lDict)
+            let rightJSON = JSONFormatter.prettyPrint(rDict)
+            let leftLines = leftJSON.components(separatedBy: "\n")
+            let rightLines = rightJSON.components(separatedBy: "\n")
 
-        let leftS  = Self.prettyJSON(lDict)
-        let rightS = Self.prettyJSON(rDict)
+            // Line-level diff (Myers) → aligned output
+            let aligned = LineDiffer.diff(left: leftLines, right: rightLines)
+            if aligned.allSatisfy({ $0.status == .context }) { return nil }
 
-        // Skip structural diff for very large payloads
-        let payloadBytes = leftS.utf8.count + rightS.utf8.count
-        if payloadBytes > diffSizeLimit {
-            diffState = .sideBySide(leftJSON: leftS, rightJSON: rightS,
-                                    summary: nil, changes: [])
-            return
-        }
+            // Summary
+            var added = 0, removed = 0, modified = 0
+            for line in aligned {
+                switch line.status {
+                case .added: added += 1
+                case .removed: removed += 1
+                case .modified: modified += 1
+                case .context: break
+                }
+            }
+            let total = added + removed + modified
+            let summary = "\(total) change\(total == 1 ? "" : "s")  ·  \(added) added  ·  \(removed) removed  ·  \(modified) modified"
 
-        let rows = await Task(priority: .userInitiated) {
-            JSONDiffer.diff(left: lDict, right: rDict)
+            // Change indices: first row of each contiguous change hunk
+            var changeIndices: [Int] = []
+            for (i, line) in aligned.enumerated() {
+                if line.status != .context {
+                    if i == 0 || aligned[i - 1].status == .context {
+                        changeIndices.append(i)
+                    }
+                }
+            }
+
+            // Build attributed strings
+            let la = DiffAttrBuilder.build(aligned: aligned, isLeft: true, isDark: isDark)
+            let ra = DiffAttrBuilder.build(aligned: aligned, isLeft: false, isDark: isDark)
+
+            return DiffResult(leftAttr: la, rightAttr: ra, summary: summary, changeIndices: changeIndices)
         }.value
+
         guard !Task.isCancelled else { return }
+        if let result {
+            currentChange = 0
+            diffState = .ready(result)
+            if !result.changeIndices.isEmpty {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    syncCoordinator.jumpToRow(result.changeIndices[0])
+                }
+            }
+        } else { diffState = .identical }
+    }
+}
 
-        if rows.allSatisfy({ $0.status == .unchanged || $0.status == .containerClean }) {
-            diffState = .identical; return
+// MARK: - Attributed string builder
+
+private enum DiffAttrBuilder {
+
+    static func build(aligned: [AlignedDiffLine], isLeft: Bool, isDark: Bool) -> NSAttributedString {
+        let baseFont: NSFont = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        let baseFg: NSColor = isDark ? NSColor(calibratedWhite: 0.88, alpha: 1) : NSColor(calibratedWhite: 0.12, alpha: 1)
+        let numFg: NSColor = isDark ? NSColor(calibratedWhite: 0.40, alpha: 1) : NSColor(calibratedWhite: 0.60, alpha: 1)
+        let sepFg: NSColor = isDark ? NSColor(calibratedWhite: 0.25, alpha: 1) : NSColor(calibratedWhite: 0.82, alpha: 1)
+        let blankBg: NSColor = isDark ? NSColor(calibratedWhite: 0.12, alpha: 1) : NSColor(calibratedWhite: 0.95, alpha: 1)
+
+        // Build plain text: "NNNNN | content" per line
+        var plain = ""
+        plain.reserveCapacity(aligned.count * 50)
+        for (i, line) in aligned.enumerated() {
+            if i > 0 { plain += "\n" }
+            let lineNum = isLeft ? line.leftLineNum : line.rightLineNum
+            let text = isLeft ? line.leftText : line.rightText
+            if let n = lineNum {
+                plain += String(format: "%5d | ", n)
+            } else {
+                plain += "      | "  // blank line number for missing side
+            }
+            plain += text
         }
 
-        // ALL visually interesting rows — used for line background coloring.
-        // Sidebar is gone; every change is communicated through line colors alone.
-        let changes = rows.filter {
-            $0.status == .added || $0.status == .removed ||
-            $0.status == .modified || $0.status == .containerChanged
+        // Fixed line height ensures both panels have identical pixel height per row — critical for scroll sync.
+        let paraStyle = NSMutableParagraphStyle()
+        paraStyle.minimumLineHeight = 14
+        paraStyle.maximumLineHeight = 14
+        paraStyle.lineSpacing = 0
+        paraStyle.paragraphSpacing = 0
+        paraStyle.paragraphSpacingBefore = 0
+
+        let result = NSMutableAttributedString(string: plain, attributes: [
+            .font: baseFont, .foregroundColor: baseFg, .paragraphStyle: paraStyle
+        ])
+        let ns = plain as NSString
+        let len = ns.length
+
+        // Walk lines: apply line numbers, diff backgrounds, syntax colors
+        var pos = 0; var rowIdx = 0
+        while pos < len {
+            var lineEnd = pos; var ce = pos
+            ns.getLineStart(nil, end: &lineEnd, contentsEnd: &ce, for: NSRange(location: pos, length: 0))
+            if lineEnd <= pos { lineEnd = min(pos + 1, len) }
+            let range = NSRange(location: pos, length: lineEnd - pos)
+
+            // Line number styling
+            if lineEnd - pos >= 8 {
+                result.addAttribute(.foregroundColor, value: numFg, range: NSRange(location: pos, length: 6))
+                result.addAttribute(.foregroundColor, value: sepFg, range: NSRange(location: pos + 6, length: 2))
+            }
+
+            // Diff background
+            if rowIdx < aligned.count {
+                let line = aligned[rowIdx]
+                let lineNum = isLeft ? line.leftLineNum : line.rightLineNum
+
+                if lineNum == nil {
+                    // Blank placeholder — dim background
+                    result.addAttribute(.backgroundColor, value: blankBg, range: range)
+                } else {
+                    switch line.status {
+                    case .removed where isLeft:
+                        result.addAttribute(.backgroundColor, value: removedBg(isDark), range: range)
+                    case .added where !isLeft:
+                        result.addAttribute(.backgroundColor, value: addedBg(isDark), range: range)
+                    case .modified:
+                        result.addAttribute(.backgroundColor, value: modifiedBg(isDark), range: range)
+                    default: break
+                    }
+                }
+            }
+
+            // Syntax coloring
+            syntaxColor(result, ns: ns, start: pos, ce: ce, off: 8, isDark: isDark)
+
+            pos = lineEnd; rowIdx += 1
         }
 
-        let focus    = changes.filter(\.isFocusPoint)
-        let added    = focus.filter { $0.status == .added    }.count
-        let removed  = focus.filter { $0.status == .removed  }.count
-        let modified = focus.filter { $0.status == .modified }.count
-        let total    = added + removed + modified
-        let summary  = total == 0
-            ? "No leaf changes (structure only)"
-            : "\(total) change\(total == 1 ? "" : "s")  ·  \(added) added  ·  \(removed) removed  ·  \(modified) modified"
-
-        diffState = .sideBySide(leftJSON: leftS, rightJSON: rightS,
-                                summary: summary, changes: changes)
+        return result.copy() as! NSAttributedString
     }
 
-    private static func prettyJSON(_ dict: [String: Any]) -> String {
-        let s = JSONFormatter.prettyPrint(dict)
-        return s.isEmpty ? "(empty payload)" : s
+    // MARK: Diff colors
+
+    private static func removedBg(_ isDark: Bool) -> NSColor {
+        isDark ? NSColor(calibratedRed: 0.60, green: 0.10, blue: 0.10, alpha: 0.50)
+               : NSColor(calibratedRed: 1.00, green: 0.85, blue: 0.85, alpha: 1.00)
+    }
+    private static func addedBg(_ isDark: Bool) -> NSColor {
+        isDark ? NSColor(calibratedRed: 0.08, green: 0.45, blue: 0.15, alpha: 0.50)
+               : NSColor(calibratedRed: 0.85, green: 1.00, blue: 0.87, alpha: 1.00)
+    }
+    private static func modifiedBg(_ isDark: Bool) -> NSColor {
+        isDark ? NSColor(calibratedRed: 0.65, green: 0.45, blue: 0.05, alpha: 0.65)
+               : NSColor(calibratedRed: 1.00, green: 0.90, blue: 0.60, alpha: 1.00)
+    }
+
+    // MARK: Syntax coloring
+
+    private static func syntaxColor(_ m: NSMutableAttributedString, ns: NSString, start: Int, ce: Int, off: Int, isDark: Bool) {
+        let kC: NSColor = isDark ? NSColor(calibratedRed: 0.40, green: 0.80, blue: 1.00, alpha: 1) : NSColor(calibratedRed: 0.00, green: 0.32, blue: 0.80, alpha: 1)
+        let sC: NSColor = isDark ? NSColor(calibratedRed: 0.92, green: 0.65, blue: 0.35, alpha: 1) : NSColor(calibratedRed: 0.62, green: 0.22, blue: 0.00, alpha: 1)
+        let nC: NSColor = isDark ? NSColor(calibratedRed: 0.65, green: 0.92, blue: 0.48, alpha: 1) : NSColor(calibratedRed: 0.06, green: 0.44, blue: 0.06, alpha: 1)
+        let bC: NSColor = isDark ? NSColor(calibratedRed: 0.82, green: 0.52, blue: 0.98, alpha: 1) : NSColor(calibratedRed: 0.48, green: 0.08, blue: 0.72, alpha: 1)
+        let uC: NSColor = isDark ? NSColor(calibratedRed: 0.55, green: 0.55, blue: 0.55, alpha: 1) : NSColor(calibratedRed: 0.46, green: 0.46, blue: 0.46, alpha: 1)
+        var p = start + off; if p >= ce { return }
+        while p < ce && ns.character(at: p) == 32 { p += 1 }; guard p < ce else { return }
+        let c0 = ns.character(at: p)
+        if c0 == 34 {
+            let qs = p; p += 1
+            while p < ce { let c = ns.character(at: p); if c == 92 { p = min(p+2, ce); continue }; if c == 34 { p += 1; break }; p += 1 }
+            let qe = p; var q = p; while q < ce && ns.character(at: q) == 32 { q += 1 }
+            if q < ce && ns.character(at: q) == 58 {
+                m.addAttribute(.foregroundColor, value: kC, range: NSRange(location: qs, length: qe - qs))
+                q += 1; while q < ce && ns.character(at: q) == 32 { q += 1 }
+                cVal(m, ns: ns, s: q, e: ce, sC: sC, nC: nC, bC: bC, uC: uC)
+            } else { m.addAttribute(.foregroundColor, value: sC, range: NSRange(location: qs, length: qe - qs)) }
+        } else if c0 != 123 && c0 != 125 && c0 != 91 && c0 != 93 { cVal(m, ns: ns, s: p, e: ce, sC: sC, nC: nC, bC: bC, uC: uC) }
+    }
+
+    private static func cVal(_ m: NSMutableAttributedString, ns: NSString, s: Int, e: Int,
+                              sC: NSColor, nC: NSColor, bC: NSColor, uC: NSColor) {
+        guard s < e else { return }
+        var end = e; while end > s { let c = ns.character(at: end-1); if c == 44 || c == 32 { end -= 1 } else { break } }
+        guard end > s else { return }; let r = NSRange(location: s, length: end - s)
+        switch ns.character(at: s) {
+        case 34: m.addAttribute(.foregroundColor, value: sC, range: r)
+        case 116, 102: m.addAttribute(.foregroundColor, value: bC, range: r)
+        case 110: m.addAttribute(.foregroundColor, value: uC, range: r)
+        case 123, 125, 91, 93: break
+        default: m.addAttribute(.foregroundColor, value: nC, range: r)
+        }
     }
 }
 
 // MARK: - Scroll sync coordinator
 
-/// Keeps both text views scrolled to the same relative position.
-/// Uses NSView.boundsDidChangeNotification on the NSClipView so that
-/// mouse wheel, trackpad, and keyboard scroll are all captured.
 final class ScrollSyncCoordinator {
-    var leftScroll:   NSScrollView?
-    var rightScroll:  NSScrollView?
-    var leftTV:       NSTextView?
-    var rightTV:      NSTextView?
+    var leftScroll: NSScrollView?; var rightScroll: NSScrollView?
+    var leftTV: NSTextView?; var rightTV: NSTextView?
     private var isSyncing = false
 
+    /// Both panels have identical line counts → sync by absolute Y offset.
     func peerDidScroll(isLeft: Bool) {
         guard !isSyncing else { return }
-        let src  = isLeft ? leftScroll  : rightScroll
-        let tgt  = isLeft ? rightScroll : leftScroll
-        guard let src, let tgt,
-              let srcDoc = src.documentView,
-              let tgtDoc = tgt.documentView else { return }
-        let srcH = srcDoc.frame.height
-        guard srcH > 0 else { return }
-        let pct  = src.contentView.bounds.origin.y / srcH
-        let tgtY = max(0, pct * tgtDoc.frame.height)
+        let src = isLeft ? leftScroll : rightScroll
+        let tgt = isLeft ? rightScroll : leftScroll
+        guard let src, let tgt else { return }
         isSyncing = true
-        tgt.contentView.scroll(to: NSPoint(x: 0, y: tgtY))
-        tgt.reflectScrolledClipView(tgt.contentView)
+        var origin = tgt.contentView.bounds.origin
+        origin.y = src.contentView.bounds.origin.y
+        tgt.contentView.setBoundsOrigin(origin)
         isSyncing = false
     }
 
-    /// Scrolls and shows a find-indicator ring on `key` in both panels.
-    func jumpToKey(_ key: String) {
-        guard !key.isEmpty else { return }
-        let q = "\"" + key + "\""
+    /// Jump to a specific row index (0-based) in both panels.
+    func jumpToRow(_ row: Int) {
+        guard row >= 0 else { return }
+        // Search for the line number prefix of the target row
+        // Row 0 = line 1, so we search for that line's prefix in the text
         for tv in [leftTV, rightTV].compactMap({ $0 }) {
-            let r = (tv.string as NSString).range(of: q, options: .caseInsensitive)
-            guard r.location != NSNotFound else { continue }
-            tv.scrollRangeToVisible(r)
-            tv.showFindIndicator(for: r)
+            let ns = tv.string as NSString
+            // Find the Nth newline to get to the row
+            var pos = 0
+            for _ in 0..<row {
+                let r = ns.range(of: "\n", range: NSRange(location: pos, length: ns.length - pos))
+                if r.location == NSNotFound { break }
+                pos = r.location + 1
+            }
+            // Expand to full line
+            var ls = pos; var le = pos
+            ns.getLineStart(&ls, end: &le, contentsEnd: nil, for: NSRange(location: pos, length: 0))
+            let full = NSRange(location: ls, length: le - ls)
+            tv.scrollRangeToVisible(full)
+            tv.showFindIndicator(for: full)
         }
     }
 }
 
 // MARK: - Diff text view
 
-/// Read-only NSTextView with three layers of attributed-string decoration:
-///   1. JSON syntax colours  (key=blue, string=amber, number=green, bool/null=purple/grey)
-///   2. Diff background colours  (added=green, removed=red, modified=orange, container=yellow)
-///      Keyed on (leading-space-count, key-name) so only the exact changed line is lit,
-///      never a same-named key at a different nesting depth.
-///   3. Search highlights  (amber background, black foreground)
 private struct DiffTextView: NSViewRepresentable {
-    var text:       String
-    var syncCoord:  ScrollSyncCoordinator
-    var isLeft:     Bool
-    var changes:    [DiffRow]
-    var isDark:     Bool
-    var searchText: String
-
-    // MARK: NSViewRepresentable
+    let attrText: NSAttributedString; let syncCoord: ScrollSyncCoordinator; let isLeft: Bool
 
     func makeNSView(context: Context) -> NSScrollView {
         let sv = NSScrollView()
-        sv.drawsBackground       = true
-        sv.backgroundColor       = .textBackgroundColor
-        sv.hasVerticalScroller   = true
-        sv.hasHorizontalScroller = false
-        sv.autohidesScrollers    = true
-        sv.borderType            = .noBorder
+        sv.drawsBackground = true; sv.backgroundColor = .textBackgroundColor
+        sv.hasVerticalScroller = true; sv.hasHorizontalScroller = false
+        sv.autohidesScrollers = true; sv.borderType = .noBorder
 
         let tv = NSTextView()
-        tv.isEditable              = false
-        tv.isSelectable            = true
-        tv.isRichText              = true     // required for background-color attributes
-        tv.drawsBackground         = false
-        tv.importsGraphics         = false
-        tv.font                    = .monospacedSystemFont(ofSize: 10, weight: .regular)
-        tv.textContainerInset      = NSSize(width: 8, height: 8)
-        tv.minSize                 = .zero
-        tv.maxSize                 = NSSize(width: CGFloat.greatestFiniteMagnitude,
-                                            height: CGFloat.greatestFiniteMagnitude)
-        tv.isVerticallyResizable   = true
-        tv.isHorizontallyResizable = false
-        tv.autoresizingMask        = [.width]
-        tv.textContainer?.lineFragmentPadding  = 0
-        // widthTracksTextView = true means the container width follows the text-view width,
-        // which follows the scroll-view content width via autoresizingMask → correct reflow
-        // when the window is resized or zoomed.
-        tv.textContainer?.widthTracksTextView  = true
+        tv.isEditable = false; tv.isSelectable = true; tv.isRichText = true
+        tv.drawsBackground = false; tv.importsGraphics = false
+        tv.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        tv.textContainerInset = NSSize(width: 4, height: 4)
+        tv.minSize = .zero
+        tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        tv.isVerticallyResizable = true; tv.isHorizontallyResizable = false
+        tv.autoresizingMask = [.width]
+        tv.textContainer?.lineFragmentPadding = 0
+        tv.textContainer?.widthTracksTextView = true
+        tv.usesFindBar = true; tv.isIncrementalSearchingEnabled = true
 
-        apply(to: tv, search: searchText)
+        tv.textStorage?.setAttributedString(attrText)
         sv.documentView = tv
 
-        if isLeft { syncCoord.leftScroll  = sv; syncCoord.leftTV  = tv }
-        else       { syncCoord.rightScroll = sv; syncCoord.rightTV = tv }
+        if isLeft { syncCoord.leftScroll = sv; syncCoord.leftTV = tv }
+        else { syncCoord.rightScroll = sv; syncCoord.rightTV = tv }
 
-        // Observe clip-view bounds changes — fires for trackpad, mouse wheel, and keyboard.
         sv.contentView.postsBoundsChangedNotifications = true
-        NotificationCenter.default.addObserver(
-            context.coordinator,
-            selector: #selector(Coordinator.clipped(_:)),
-            name: NSView.boundsDidChangeNotification,
-            object: sv.contentView)
-
-        context.coordinator.renderedText   = text
-        context.coordinator.renderedSearch = searchText
-        context.coordinator.renderedIsDark = isDark
-
+        NotificationCenter.default.addObserver(context.coordinator, selector: #selector(Coordinator.clipped(_:)),
+                                               name: NSView.boundsDidChangeNotification, object: sv.contentView)
         return sv
     }
 
-    func updateNSView(_ sv: NSScrollView, context: Context) {
-        guard let tv = sv.documentView as? NSTextView else { return }
-        let c = context.coordinator
-        guard c.renderedText   != text   ||
-              c.renderedSearch != searchText ||
-              c.renderedIsDark != isDark else { return }
-        c.renderedText   = text
-        c.renderedSearch = searchText
-        c.renderedIsDark = isDark
-        apply(to: tv, search: searchText)
-    }
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(isLeft: isLeft, syncCoord: syncCoord)
-    }
-
-    // MARK: Apply attributed string
-
-    private func apply(to tv: NSTextView, search: String) {
-        tv.textStorage?.setAttributedString(
-            Self.buildAttributed(json: text, changes: changes,
-                                 isLeft: isLeft, isDark: isDark, searchText: search))
-    }
-
-    // MARK: Attributed-string builder (three passes)
-
-    static func buildAttributed(json: String, changes: [DiffRow],
-                                isLeft: Bool, isDark: Bool,
-                                searchText: String) -> NSAttributedString {
-        let baseFont: NSFont = .monospacedSystemFont(ofSize: 10, weight: .regular)
-        let baseFg: NSColor  = isDark
-            ? NSColor(calibratedWhite: 0.88, alpha: 1)
-            : NSColor(calibratedWhite: 0.12, alpha: 1)
-
-        let result = NSMutableAttributedString(string: json, attributes: [
-            .font:            baseFont,
-            .foregroundColor: baseFg
-        ])
-
-        // ── Pass 1: syntax colours ────────────────────────────────────────────────
-        applySyntaxColors(result, ns: json as NSString, isDark: isDark)
-
-        // ── Pass 2: diff background colours ──────────────────────────────────────
-        // Build a lookup:  leadingSpaces → [keyName → backgroundColor]
-        // leadingSpaces == depth × 2  (JSONFormatter.prettyPrint invariant).
-        // The two-level key means only the exact (depth, name) line is coloured —
-        // a key that appears at multiple nesting levels is never mis-highlighted.
-        if !changes.isEmpty {
-            var colorMap = [Int: [String: NSColor]]()
-            for row in changes {
-                guard let key = row.key else { continue }
-                let spaces = row.depth * 2
-                guard let color = diffLineColor(status: row.status,
-                                                isLeft: isLeft, isDark: isDark) else { continue }
-                if colorMap[spaces] == nil { colorMap[spaces] = [:] }
-                // Leaf changes win over containerChanged for the same (depth, key).
-                if colorMap[spaces]![key] == nil { colorMap[spaces]![key] = color }
-            }
-
-            if !colorMap.isEmpty {
-                let ns  = json as NSString
-                let len = ns.length
-                var pos = 0
-                while pos < len {
-                    var lineEnd = pos
-                    ns.getLineStart(nil, end: &lineEnd, contentsEnd: nil,
-                                    for: NSRange(location: pos, length: 0))
-                    if lineEnd <= pos { lineEnd = min(pos + 1, len) }
-                    let range = NSRange(location: pos, length: lineEnd - pos)
-                    if let bg = matchLineColor(ns.substring(with: range), map: colorMap) {
-                        result.addAttribute(.backgroundColor, value: bg, range: range)
-                    }
-                    pos = lineEnd
-                }
-            }
-        }
-
-        // ── Pass 3: search highlights ─────────────────────────────────────────────
-        if !searchText.isEmpty {
-            let ns  = json as NSString
-            let len = ns.length
-            let hlBg = isDark
-                ? NSColor(calibratedHue: 0.13, saturation: 0.85, brightness: 0.95, alpha: 0.90)
-                : NSColor(calibratedHue: 0.13, saturation: 0.95, brightness: 1.00, alpha: 0.92)
-            let hlFg   = NSColor.black
-            let hlFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold)
-            var pos = 0
-            while pos < len {
-                let r = ns.range(of: searchText, options: .caseInsensitive,
-                                 range: NSRange(location: pos, length: len - pos))
-                guard r.location != NSNotFound, r.length > 0 else { break }
-                result.addAttributes([.backgroundColor: hlBg,
-                                      .foregroundColor: hlFg,
-                                      .font: hlFont], range: r)
-                pos = r.location + r.length
-            }
-        }
-
-        return result
-    }
-
-    // MARK: Diff line-color helpers
-
-    /// Looks up the background color for a single text line using the colorMap.
-    /// 1. Count leading spaces.
-    /// 2. Find the bucket for that depth.
-    /// 3. Extract `"key":` from the line.
-    /// 4. Return the color if the key is in the bucket.
-    private static func matchLineColor(_ line: String,
-                                       map: [Int: [String: NSColor]]) -> NSColor? {
-        var spaces = 0
-        for ch in line { if ch == " " { spaces += 1 } else { break } }
-        guard let bucket = map[spaces] else { return nil }
-
-        let trimmed = String(line.dropFirst(spaces))
-        guard trimmed.hasPrefix("\"") else { return nil }
-        let body = trimmed.dropFirst()                        // after opening "
-        guard let closeIdx = body.firstIndex(of: "\"") else { return nil }
-        let key  = String(body[body.startIndex..<closeIdx])
-        let tail = body[closeIdx...].dropFirst()              // skip closing "
-                       .drop(while: { $0 == " " })
-        guard tail.hasPrefix(":") else { return nil }
-        return bucket[key]
-    }
-
-    /// Background color for a changed line on this side of the diff.
-    /// Returns nil for statuses that produce no visible background (e.g. .removed on the right).
-    private static func diffLineColor(status: DiffRow.Status,
-                                      isLeft: Bool, isDark: Bool) -> NSColor? {
-        let a: CGFloat = isDark ? 0.30 : 0.22
-        switch status {
-        case .removed:
-            return isLeft
-                ? NSColor(calibratedRed: 0.95, green: 0.12, blue: 0.12, alpha: a)
-                : nil
-        case .added:
-            return isLeft
-                ? nil
-                : NSColor(calibratedRed: 0.06, green: 0.80, blue: 0.28, alpha: a)
-        case .modified:
-            // Orange on both sides — value changed.
-            return NSColor(calibratedRed: 1.00, green: 0.55, blue: 0.00, alpha: a * 0.85)
-        case .containerChanged:
-            // Subtle yellow — "something inside this block changed".
-            return NSColor(calibratedRed: 1.00, green: 0.88, blue: 0.00,
-                           alpha: isDark ? 0.14 : 0.10)
-        default:
-            return nil
-        }
-    }
-
-    // MARK: JSON syntax highlighting
-
-    /// Applies foreground token colours.  Works directly on NSString unichar indices —
-    /// no regex, no per-line String allocations.
-    ///
-    ///   key name      → blue/cyan
-    ///   string value  → warm amber
-    ///   number        → green
-    ///   true/false    → purple/lavender
-    ///   null          → grey
-    ///   { } [ ] ,     → base colour (no override)
-    private static func applySyntaxColors(_ mas: NSMutableAttributedString,
-                                          ns: NSString, isDark: Bool) {
-        let keyCol:  NSColor = isDark
-            ? NSColor(calibratedRed: 0.40, green: 0.80, blue: 1.00, alpha: 1) // sky blue
-            : NSColor(calibratedRed: 0.00, green: 0.32, blue: 0.80, alpha: 1) // royal blue
-        let strCol:  NSColor = isDark
-            ? NSColor(calibratedRed: 0.92, green: 0.65, blue: 0.35, alpha: 1) // amber
-            : NSColor(calibratedRed: 0.62, green: 0.22, blue: 0.00, alpha: 1) // burnt orange
-        let numCol:  NSColor = isDark
-            ? NSColor(calibratedRed: 0.65, green: 0.92, blue: 0.48, alpha: 1) // lime
-            : NSColor(calibratedRed: 0.06, green: 0.44, blue: 0.06, alpha: 1) // forest green
-        let boolCol: NSColor = isDark
-            ? NSColor(calibratedRed: 0.82, green: 0.52, blue: 0.98, alpha: 1) // lavender
-            : NSColor(calibratedRed: 0.48, green: 0.08, blue: 0.72, alpha: 1) // deep purple
-        let nullCol: NSColor = isDark
-            ? NSColor(calibratedRed: 0.55, green: 0.55, blue: 0.55, alpha: 1) // mid-grey
-            : NSColor(calibratedRed: 0.46, green: 0.46, blue: 0.46, alpha: 1)
-
-        let len = ns.length
-        var pos = 0
-        while pos < len {
-            var lineEnd     = pos
-            var contentsEnd = pos
-            ns.getLineStart(nil, end: &lineEnd, contentsEnd: &contentsEnd,
-                            for: NSRange(location: pos, length: 0))
-            let ce = contentsEnd
-
-            // skip leading spaces
-            var p = pos
-            while p < ce && ns.character(at: p) == 32 { p += 1 }
-            guard p < ce else { pos = lineEnd > pos ? lineEnd : len; continue }
-
-            let c0 = ns.character(at: p)
-
-            if c0 == 34 {   // '"' — a quoted token starts here
-                let qStart = p
-                p += 1
-                while p < ce {
-                    let c = ns.character(at: p)
-                    if c == 92 { p += 2; continue }  // backslash — skip escaped char
-                    if c == 34 { p += 1; break }      // closing "
-                    p += 1
-                }
-                let qEnd = p  // position after closing "
-
-                // Is this a key (followed by ':')?
-                var q = p
-                while q < ce && ns.character(at: q) == 32 { q += 1 }
-                if q < ce && ns.character(at: q) == 58 {   // ':'
-                    mas.addAttribute(.foregroundColor, value: keyCol,
-                                     range: NSRange(location: qStart, length: qEnd - qStart))
-                    q += 1
-                    while q < ce && ns.character(at: q) == 32 { q += 1 }
-                    colorValue(mas: mas, ns: ns, start: q, end: ce,
-                               strCol: strCol, numCol: numCol, boolCol: boolCol, nullCol: nullCol)
-                } else {
-                    // String value (array element or bare root string)
-                    mas.addAttribute(.foregroundColor, value: strCol,
-                                     range: NSRange(location: qStart, length: qEnd - qStart))
-                }
-            } else if c0 != 123 && c0 != 125 && c0 != 91 && c0 != 93 {
-                // Not { } [ ] — must be a bare value (number, true, false, null)
-                colorValue(mas: mas, ns: ns, start: p, end: ce,
-                           strCol: strCol, numCol: numCol, boolCol: boolCol, nullCol: nullCol)
-            }
-
-            pos = lineEnd > pos ? lineEnd : len
-        }
-    }
-
-    private static func colorValue(mas: NSMutableAttributedString,
-                                   ns: NSString, start: Int, end: Int,
-                                   strCol: NSColor, numCol: NSColor,
-                                   boolCol: NSColor, nullCol: NSColor) {
-        guard start < end else { return }
-        var e = end
-        // strip trailing comma and spaces
-        while e > start {
-            let c = ns.character(at: e - 1)
-            if c == 44 || c == 32 { e -= 1 } else { break }
-        }
-        guard e > start else { return }
-        let range = NSRange(location: start, length: e - start)
-        switch ns.character(at: start) {
-        case 34:            mas.addAttribute(.foregroundColor, value: strCol,  range: range)  // "
-        case 116, 102:      mas.addAttribute(.foregroundColor, value: boolCol, range: range)  // t / f
-        case 110:           mas.addAttribute(.foregroundColor, value: nullCol, range: range)  // n(ull)
-        case 123, 125, 91, 93: break  // { } [ ] — structural, keep base colour
-        default:            mas.addAttribute(.foregroundColor, value: numCol,  range: range)  // digit/-
-        }
-    }
-
-    // MARK: Coordinator
+    func updateNSView(_ sv: NSScrollView, context: Context) {}
+    func makeCoordinator() -> Coordinator { Coordinator(isLeft: isLeft, syncCoord: syncCoord) }
 
     final class Coordinator: NSObject {
-        let isLeft:    Bool
-        let syncCoord: ScrollSyncCoordinator
-        var renderedText:   String = ""
-        var renderedSearch: String = ""
-        var renderedIsDark: Bool   = false
-
-        init(isLeft: Bool, syncCoord: ScrollSyncCoordinator) {
-            self.isLeft    = isLeft
-            self.syncCoord = syncCoord
-        }
-
-        @objc func clipped(_ note: Notification) {
-            syncCoord.peerDidScroll(isLeft: isLeft)
-        }
+        let isLeft: Bool; let syncCoord: ScrollSyncCoordinator
+        init(isLeft: Bool, syncCoord: ScrollSyncCoordinator) { self.isLeft = isLeft; self.syncCoord = syncCoord }
+        @objc func clipped(_ note: Notification) { syncCoord.peerDidScroll(isLeft: isLeft) }
     }
 }
