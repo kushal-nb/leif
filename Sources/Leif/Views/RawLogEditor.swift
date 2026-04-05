@@ -22,6 +22,8 @@ struct RawLogEditor: NSViewRepresentable {
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticSpellingCorrectionEnabled = false
         textView.isContinuousSpellCheckingEnabled = false
+        textView.usesFindBar = true
+        textView.isIncrementalSearchingEnabled = true
         textView.isVerticallyResizable = true
         // autoresizingMask is set per-mode inside applyWrapping
         textView.delegate = context.coordinator
@@ -50,7 +52,10 @@ struct RawLogEditor: NSViewRepresentable {
 
     /// Light: white paper + gray gutter so the edit surface is obvious. Dark: system text field colors.
     private func applyFieldChrome(scrollView: NSScrollView, textView: NSTextView) {
-        textView.insertionPointColor = .labelColor
+        // Bright cursor in dark mode so it's visible against dark background
+        textView.insertionPointColor = colorScheme == .dark
+            ? NSColor(calibratedWhite: 0.95, alpha: 1)
+            : NSColor(calibratedWhite: 0.10, alpha: 1)
         scrollView.drawsBackground = true
         let clip = scrollView.contentView
         clip.drawsBackground = true

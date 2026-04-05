@@ -47,7 +47,7 @@ struct LogListView: View {
                         .tag(entry.id)
                         .contextMenu { diffContextMenu(for: entry) }
                 }
-                .listStyle(.plain)
+                .listStyle(.inset(alternatesRowBackgrounds: true))
             }
         }
         // Child `Task` (not `detached`). Cooperative `Task.isCancelled` checks so ⌘Q / teardown can bail quickly.
@@ -251,9 +251,9 @@ struct LogRowView: View {
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundColor(colorScheme == .dark
                         ? Color(nsColor: .systemTeal).opacity(0.85)
-                        : Color(red: 0.0, green: 0.48, blue: 0.55))
+                        : Color(red: 0.0, green: 0.38, blue: 0.48))
                     .lineLimit(1)
-                    .frame(width: 148, alignment: .leading)
+                    .fixedSize(horizontal: true, vertical: false)
             }
             Text(entry.message)
                 .font(.system(size: 12))

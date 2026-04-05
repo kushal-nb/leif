@@ -150,13 +150,23 @@ final class LogViewModel: ObservableObject {
     private var parseTask:   Task<Void, Never>? = nil
     private var prewarmTask: Task<Void, Never>? = nil
 
+    private var lastParsedText: String = ""
+
     func parse() {
-        parseTask?.cancel()
-        prewarmTask?.cancel()
-        payloadCache.clear()
         let text = rawText
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        // Skip re-parse if text is identical to last parse
+        if text == lastParsedText && !entries.isEmpty { return }
+        lastParsedText = text
+
+        parseTask?.cancel()
+        prewarmTask?.cancel()
+        // Clear old state completely before starting fresh
+        payloadCache.clear()
+        selectedEntry = nil
+        entries = []
         isParsingBusy = true
+
         parseTask = Task {
             let result = await Task.detached(priority: .userInitiated) {
                 LogParser().parse(text: text)
@@ -164,10 +174,7 @@ final class LogViewModel: ObservableObject {
             if !Task.isCancelled {
                 self.entries = result
                 self.isParsingBusy = false
-                if self.selectedEntry == nil {
-                    self.selectedEntry = result.first
-                }
-                // Pre-warm cache for all entries so row switching is instant
+                self.selectedEntry = result.first
                 self.startPrewarm(entries: result)
             }
         }
@@ -179,6 +186,7 @@ final class LogViewModel: ObservableObject {
         rawText = ""
         entries = []
         selectedEntry = nil
+        lastParsedText = ""
         payloadCache.clear()
     }
 

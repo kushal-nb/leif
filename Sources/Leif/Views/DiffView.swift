@@ -12,7 +12,7 @@ private final class EscapeClosingWindow: NSWindow {
 
 // MARK: - Window controller
 
-final class DiffWindowController {
+final class DiffWindowController: NSObject, NSWindowDelegate {
     static let shared = DiffWindowController()
     private var window: NSWindow?
 
@@ -24,6 +24,7 @@ final class DiffWindowController {
             win.title = "JSON Diff"
             win.styleMask = [.titled, .closable, .resizable, .miniaturizable]
             win.isReleasedWhenClosed = false
+            win.delegate = self
             win.minSize = NSSize(width: 900, height: 560)
             let avail = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
                         ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
@@ -37,6 +38,12 @@ final class DiffWindowController {
         win.appearance = NSAppearance(named: isDark ? .darkAqua : .aqua)
         win.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Free diff data when window is closed — the attributed strings and aligned lines
+    /// can be large (200K+ lines). Replace with an empty view to release them.
+    func windowWillClose(_ notification: Notification) {
+        window?.contentViewController = NSHostingController(rootView: EmptyView())
     }
 }
 
@@ -248,17 +255,13 @@ private enum DiffAttrBuilder {
         let blankBg: NSColor = isDark ? NSColor(calibratedWhite: 0.12, alpha: 1) : NSColor(calibratedWhite: 0.95, alpha: 1)
 
         // Build plain text: "NNNNN | content" per line
+        // Unified row index on BOTH panels — same row = same number, like a single document.
         var plain = ""
         plain.reserveCapacity(aligned.count * 50)
         for (i, line) in aligned.enumerated() {
             if i > 0 { plain += "\n" }
-            let lineNum = isLeft ? line.leftLineNum : line.rightLineNum
             let text = isLeft ? line.leftText : line.rightText
-            if let n = lineNum {
-                plain += String(format: "%5d | ", n)
-            } else {
-                plain += "      | "  // blank line number for missing side
-            }
+            plain += String(format: "%5d | ", i + 1)
             plain += text
         }
 
@@ -293,10 +296,10 @@ private enum DiffAttrBuilder {
             // Diff background
             if rowIdx < aligned.count {
                 let line = aligned[rowIdx]
-                let lineNum = isLeft ? line.leftLineNum : line.rightLineNum
+                let hasContent = isLeft ? (line.leftLineNum != nil) : (line.rightLineNum != nil)
 
-                if lineNum == nil {
-                    // Blank placeholder — dim background
+                if !hasContent {
+                    // Blank placeholder row — dim background
                     result.addAttribute(.backgroundColor, value: blankBg, range: range)
                 } else {
                     switch line.status {

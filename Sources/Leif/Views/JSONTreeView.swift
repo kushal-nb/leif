@@ -316,33 +316,8 @@ struct LogDetailView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             headerBar
-            Divider()
-
-            Text(entry.message)
-                .font(.system(size: 13, weight: .medium))
-                .foregroundColor(.primary)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 9)
-                .background(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(colorScheme == .light
-                              ? Color.white
-                              : Color.white.opacity(0.06))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(Color.primary.opacity(colorScheme == .dark ? 0.20 : 0.12), lineWidth: 1)
-                )
-                .padding(.horizontal, 12)
-                .padding(.top, 8)
-                .padding(.bottom, entry.hasPayload ? 4 : 8)
-
             if entry.hasPayload {
                 Divider()
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 4)
                 payloadView
             }
         }
@@ -381,38 +356,51 @@ struct LogDetailView: View {
     }
 
     // MARK: - Header
+
     private var headerBar: some View {
         VStack(spacing: 0) {
-            // Thin level-colored accent strip
+            // Level-colored accent strip
             Rectangle()
                 .fill(entry.level.color.opacity(colorScheme == .dark ? 0.55 : 0.65))
                 .frame(height: 2)
 
-            HStack(spacing: 8) {
+            // Row 1: log meta + message
+            HStack(spacing: 6) {
                 LevelBadge(level: entry.level)
                 if let ts = entry.appTimestamp {
-                    detailMetaChip(colorScheme: colorScheme) {
-                        Text(ts)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundColor(colorScheme == .light ? Color(nsColor: .labelColor) : Color.secondary)
-                            .textSelection(.enabled)
-                    }
+                    Text(ts)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
                 }
                 if let caller = entry.caller {
-                    detailMetaChip(colorScheme: colorScheme) {
-                        Text(caller)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundColor(colorScheme == .light ? Color(nsColor: .labelColor) : Color.secondary)
-                            .lineLimit(1)
-                            .textSelection(.enabled)
-                    }
+                    Text(caller)
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundColor(colorScheme == .dark
+                            ? Color(nsColor: .systemTeal)
+                            : Color(red: 0.0, green: 0.38, blue: 0.48))
+                        .lineLimit(1)
                 }
-                Spacer()
-                if entry.hasPayload {
-                    if isBuilding {
-                        ProgressView().scaleEffect(0.55)
-                            .padding(.trailing, 4)
-                    }
+                Text(entry.message)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+                    .textSelection(.enabled)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(
+                colorScheme == .dark
+                    ? Color.white.opacity(0.04)
+                    : entry.level.color.opacity(0.06)
+            )
+
+            // Row 2: tab bar + search nav + copy (only when payload exists)
+            if entry.hasPayload {
+                Divider()
+                HStack(spacing: 6) {
+                    // Tab buttons with icon + label
                     HStack(spacing: 2) {
                         ForEach(availableTabs, id: \.rawValue) { t in
                             let active = tab == t
@@ -435,6 +423,7 @@ struct LogDetailView: View {
                                 )
                             }
                             .buttonStyle(.plain)
+                            .help(t.rawValue)
                             .disabled(isBuilding && t != .raw)
                         }
                     }
@@ -443,35 +432,36 @@ struct LogDetailView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                     .overlay(RoundedRectangle(cornerRadius: 8)
                         .stroke(Color(nsColor: .separatorColor), lineWidth: colorScheme == .dark ? 0.5 : 0.75))
-                }
-                // Match navigation — only shown for JSON / Raw when search is active
-                if !searchText.isEmpty, (tab == .json || tab == .raw), totalMatches > 0 {
-                    HStack(spacing: 2) {
-                        Button(action: prevMatch) {
-                            Image(systemName: "chevron.up")
-                                .font(.system(size: 9, weight: .semibold))
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundColor(.secondary)
-                        Text("\(matchIndex + 1)/\(totalMatches)")
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundColor(.secondary)
-                            .frame(minWidth: 32)
-                        Button(action: nextMatch) {
-                            Image(systemName: "chevron.down")
-                                .font(.system(size: 9, weight: .semibold))
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundColor(.secondary)
-                    }
-                    .padding(.horizontal, 4)
-                }
 
-                copyButton
+                    if isBuilding {
+                        ProgressView().scaleEffect(0.5)
+                    }
+
+                    Spacer(minLength: 0)
+
+                    // Search match navigation
+                    if !searchText.isEmpty, (tab == .json || tab == .raw), totalMatches > 0 {
+                        HStack(spacing: 2) {
+                            Button(action: prevMatch) {
+                                Image(systemName: "chevron.up")
+                                    .font(.system(size: 9, weight: .semibold))
+                            }.buttonStyle(.plain).foregroundColor(.secondary)
+                            Text("\(matchIndex + 1)/\(totalMatches)")
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundColor(.secondary).frame(minWidth: 28)
+                            Button(action: nextMatch) {
+                                Image(systemName: "chevron.down")
+                                    .font(.system(size: 9, weight: .semibold))
+                            }.buttonStyle(.plain).foregroundColor(.secondary)
+                        }
+                    }
+
+                    copyButton
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Color(nsColor: .controlBackgroundColor))
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 7)
-            .background(Color(nsColor: .controlBackgroundColor))
         }
     }
 

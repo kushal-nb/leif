@@ -151,13 +151,47 @@ struct ContentView: View {
             .padding(.vertical, 6)
             .background(Color(nsColor: .controlBackgroundColor))
 
-            panelDivider
+            // Draggable divider for Unix converter
+            ZStack {
+                Rectangle()
+                    .fill(isDraggingUnix
+                          ? Color.accentColor.opacity(0.30)
+                          : (colorScheme == .dark
+                             ? Color.white.opacity(0.07)
+                             : Color.black.opacity(0.10)))
+                    .frame(height: 8)
+                HStack(spacing: 3) {
+                    ForEach(0..<3, id: \.self) { _ in
+                        Circle()
+                            .fill(isDraggingUnix ? Color.accentColor : Color(nsColor: .secondaryLabelColor))
+                            .frame(width: 4, height: 4)
+                    }
+                }
+            }
+            .frame(height: 8)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                    .onChanged { v in
+                        if !isDraggingUnix {
+                            isDraggingUnix = true
+                            dragStartUnixHeight = unixHeight
+                        }
+                        unixHeight = max(30, dragStartUnixHeight - v.translation.height)
+                    }
+                    .onEnded { _ in isDraggingUnix = false }
+            )
+            .onHover { inside in
+                if inside { NSCursor.resizeUpDown.push() }
+                else { NSCursor.pop() }
+            }
 
-            // Unix → UTC converter — compact rows, scrolls when exceeding 2 rows
+            // Unix → UTC converter
             ScrollView(.vertical, showsIndicators: true) {
                 unixConverterPanel
             }
-            .frame(maxHeight: 70)
+            .frame(height: unixHeight)
+            .clipped()
         }
     }
 
@@ -165,6 +199,9 @@ struct ContentView: View {
     @State private var detailHeight: CGFloat = 0
     @State private var isDraggingDetail = false
     @State private var dragStartDetailHeight: CGFloat = 0
+    @State private var unixHeight: CGFloat = 60
+    @State private var isDraggingUnix = false
+    @State private var dragStartUnixHeight: CGFloat = 0
 
     private var outputPanel: some View {
         VStack(spacing: 0) {
@@ -240,48 +277,57 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Unix → UTC converter panel — compact inline rows
+    // MARK: - Unix → UTC converter panel
     private var unixConverterPanel: some View {
         VStack(alignment: .leading, spacing: 4) {
             ForEach(Array(unixEntries.enumerated()), id: \.element.id) { idx, entry in
                 HStack(spacing: 6) {
-                    if idx == 0 {
-                        Image(systemName: "clock.arrow.2.circlepath")
-                            .font(.system(size: 9))
-                            .foregroundColor(.secondary)
+                    // Note
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Note").font(.system(size: 8, weight: .medium)).foregroundColor(.secondary)
+                        TextField("label", text: Binding(
+                            get: { unixEntries[safe: idx]?.note ?? "" },
+                            set: { if idx < unixEntries.count { unixEntries[idx].note = $0 } }
+                        ))
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 11, design: .monospaced))
+                        .frame(width: 80)
                     }
-                    TextField("note", text: Binding(
-                        get: { unixEntries[safe: idx]?.note ?? "" },
-                        set: { if idx < unixEntries.count { unixEntries[idx].note = $0 } }
-                    ))
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 10))
-                    .frame(width: 80)
 
-                    TextField("unix s/ms", text: Binding(
-                        get: { unixEntries[safe: idx]?.input ?? "" },
-                        set: { if idx < unixEntries.count { unixEntries[idx].input = $0 } }
-                    ))
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 10, design: .monospaced))
-                    .frame(width: 100)
+                    // Unix input
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Unix").font(.system(size: 8, weight: .medium)).foregroundColor(.secondary)
+                        TextField("s/ms", text: Binding(
+                            get: { unixEntries[safe: idx]?.input ?? "" },
+                            set: { if idx < unixEntries.count { unixEntries[idx].input = $0 } }
+                        ))
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 11, design: .monospaced))
+                        .frame(width: 110)
+                    }
 
                     Image(systemName: "arrow.right")
-                        .font(.system(size: 8))
+                        .font(.system(size: 9, weight: .semibold))
                         .foregroundColor(.secondary)
 
-                    if let t = convertUnix(entry.input) {
-                        Text(t)
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundColor(.secondary)
-                            .textSelection(.enabled)
-                            .lineLimit(1)
-                    } else {
-                        Text("-")
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundColor(.secondary.opacity(0.3))
+                    // UTC output
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("UTC").font(.system(size: 8, weight: .medium)).foregroundColor(.secondary)
+                        if let t = convertUnix(entry.input) {
+                            Text(t)
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                .foregroundColor(.primary)
+                                .textSelection(.enabled)
+                                .lineLimit(1)
+                        } else {
+                            Text("—")
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(.secondary.opacity(0.3))
+                        }
                     }
+
                     Spacer(minLength: 0)
+
                     if unixEntries.count > 1 {
                         Button {
                             withAnimation(.easeOut(duration: 0.2)) {
@@ -289,8 +335,7 @@ struct ContentView: View {
                             }
                         } label: {
                             Image(systemName: "minus.circle")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
+                                .font(.system(size: 11)).foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
                     }
@@ -305,12 +350,19 @@ struct ContentView: View {
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
-                        .help("Add another timestamp row")
                     }
                 }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(colorScheme == .dark
+                            ? Color.white.opacity(0.06)
+                            : Color.black.opacity(0.04))
+                )
             }
         }
-        .padding(.horizontal, 10)
+        .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .background(Color(nsColor: .controlBackgroundColor))
     }
