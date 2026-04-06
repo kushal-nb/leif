@@ -1,6 +1,10 @@
 import SwiftUI
 import AppKit
 
+extension Notification.Name {
+    static let leifFlushEditor = Notification.Name("leifFlushEditor")
+}
+
 // MARK: - Raw log text editor (non-wrapping by default, horizontally scrollable)
 
 struct RawLogEditor: NSViewRepresentable {
@@ -25,8 +29,8 @@ struct RawLogEditor: NSViewRepresentable {
         textView.usesFindBar = true
         textView.isIncrementalSearchingEnabled = true
         textView.isVerticallyResizable = true
-        // autoresizingMask is set per-mode inside applyWrapping
         textView.delegate = context.coordinator
+        context.coordinator.textView = textView
 
         scrollView.documentView = textView
         scrollView.hasVerticalScroller = true
@@ -36,23 +40,35 @@ struct RawLogEditor: NSViewRepresentable {
 
         applyWrapping(to: textView, scrollView: scrollView)
         applyFieldChrome(scrollView: scrollView, textView: textView)
+
+        // Listen for explicit flush from teardownOldState — directly clears
+        // the NSTextView without waiting for SwiftUI's update cycle.
+        NotificationCenter.default.addObserver(context.coordinator,
+            selector: #selector(Coordinator.forceFlush(_:)),
+            name: .leifFlushEditor, object: nil)
+
         return scrollView
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? NSTextView else { return }
-        if textView.string != text {
+        let tvLen = (textView.string as NSString).length
+        let bindLen = (text as NSString).length
+        if tvLen != bindLen || textView.string != text {
             let sel = textView.selectedRanges
             textView.string = text
             textView.selectedRanges = sel
+            if text.isEmpty {
+                DispatchQueue.main.async {
+                    scrollView.window?.makeFirstResponder(textView)
+                }
+            }
         }
         applyWrapping(to: textView, scrollView: scrollView)
         applyFieldChrome(scrollView: scrollView, textView: textView)
     }
 
-    /// Light: white paper + gray gutter so the edit surface is obvious. Dark: system text field colors.
     private func applyFieldChrome(scrollView: NSScrollView, textView: NSTextView) {
-        // Bright cursor in dark mode so it's visible against dark background
         textView.insertionPointColor = colorScheme == .dark
             ? NSColor(calibratedWhite: 0.95, alpha: 1)
             : NSColor(calibratedWhite: 0.10, alpha: 1)
@@ -84,9 +100,8 @@ struct RawLogEditor: NSViewRepresentable {
                 height: .greatestFiniteMagnitude)
             scrollView.hasHorizontalScroller = false
         } else {
-            // Non-wrapping: text view grows rightward; scroll view provides horizontal scroll
             textView.isHorizontallyResizable = true
-            textView.autoresizingMask = []          // must NOT pin to scroll view width
+            textView.autoresizingMask = []
             textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
                                       height: CGFloat.greatestFiniteMagnitude)
             textView.minSize = NSSize(width: 0,
@@ -103,11 +118,24 @@ struct RawLogEditor: NSViewRepresentable {
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: RawLogEditor
+        weak var textView: NSTextView?
         init(_ parent: RawLogEditor) { self.parent = parent }
 
         func textDidChange(_ notification: Notification) {
+            guard !isFlushing else { return }
             guard let tv = notification.object as? NSTextView else { return }
             parent.text = tv.string
+        }
+
+        /// Immediately clear the NSTextView text storage + layout manager caches.
+        /// Uses isFlushing flag to prevent textDidChange from zeroing the binding.
+        var isFlushing = false
+
+        @objc func forceFlush(_ notification: Notification) {
+            guard let tv = textView else { return }
+            isFlushing = true
+            tv.textStorage?.setAttributedString(NSAttributedString())
+            isFlushing = false
         }
     }
 }

@@ -35,43 +35,48 @@ enum LineDiffer {
     // MARK: - LCS-based diff (simple, correct, bounded)
 
     /// Computes edits using a simplified Myers O(ND) algorithm with a max-edit cap.
+    /// Uses sparse history to avoid O(D * vSize) memory — only stores changed diagonals per step.
     private static func computeEdits(old: [String], new: [String]) -> [Edit] {
         let n = old.count, m = new.count
         if n == 0 && m == 0 { return [] }
         if n == 0 { return (0..<m).map { .insert(newIdx: $0) } }
         if m == 0 { return (0..<n).map { .delete(oldIdx: $0) } }
 
-        // For performance: if both are very large, use a simpler LCS approach
-        // with a cap on edit distance
-        // Cap edit distance: for very similar JSONs D is small and fast.
-        // For large payloads with many differences, cap to avoid O(D * vSize) memory.
         let maxD = min(n + m, 20_000)
 
-        // V: maps diagonal k → furthest x reached. Indexed as v[k + offset].
         let offset = maxD + 1
         let vSize = 2 * offset + 1
         var v = [Int](repeating: 0, count: vSize)
         v[offset + 1] = 0
 
-        // Store snapshots of v for backtracking
-        var history: [[Int]] = []
+        // Sparse history: for each d, store only the diagonals that were written (k → x).
+        // This reduces memory from O(D * vSize) to O(D * D) which is dramatically smaller
+        // when D << (n + m).
+        var history: [[Int: Int]] = []
 
         var finalD = -1
         outer: for d in 0...maxD {
-            history.append(Array(v))
+            var snapshot: [Int: Int] = [:]
+            snapshot.reserveCapacity(2 * d + 1)
+            for k in stride(from: -d, through: d, by: 2) {
+                let idx = k + offset
+                guard idx > 0 && idx < vSize - 1 else { continue }
+                snapshot[k] = v[idx]
+            }
+            history.append(snapshot)
+
             for k in stride(from: -d, through: d, by: 2) {
                 let idx = k + offset
                 guard idx > 0 && idx < vSize - 1 else { continue }
 
                 var x: Int
                 if k == -d || (k != d && v[idx - 1] < v[idx + 1]) {
-                    x = v[idx + 1]       // came from diagonal k+1 (insert)
+                    x = v[idx + 1]
                 } else {
-                    x = v[idx - 1] + 1   // came from diagonal k-1 (delete)
+                    x = v[idx - 1] + 1
                 }
                 var y = x - k
 
-                // Extend along diagonal (matching lines)
                 while x < n && y < m && old[x] == new[y] {
                     x += 1; y += 1
                 }
@@ -86,50 +91,40 @@ enum LineDiffer {
         }
 
         if finalD < 0 {
-            // Exceeded max edits — treat as fully different
             var result: [Edit] = []
             for i in 0..<n { result.append(.delete(oldIdx: i)) }
             for j in 0..<m { result.append(.insert(newIdx: j)) }
             return result
         }
 
-        // Backtrack through history to recover the edit script
+        // Backtrack through sparse history
         var x = n, y = m
         var edits: [Edit] = []
 
         for d in stride(from: finalD, through: 1, by: -1) {
             let prev = history[d - 1]
             let k = x - y
-            let idx = k + offset
 
-            // Determine which direction we came from
             let fromInsert: Bool
             if k == -d {
                 fromInsert = true
             } else if k == d {
                 fromInsert = false
-            } else if idx > 0 && idx < vSize - 1 {
-                fromInsert = prev[idx - 1] < prev[idx + 1]
             } else {
-                fromInsert = idx <= 0
+                let leftX = prev[k - 1] ?? 0
+                let rightX = prev[k + 1] ?? 0
+                fromInsert = leftX < rightX
             }
 
             let prevK = fromInsert ? k + 1 : k - 1
-            let prevIdx = prevK + offset
-            guard prevIdx >= 0 && prevIdx < vSize else {
-                // Safety: can't backtrack, emit remaining as changes
-                break
-            }
-            let prevX = prev[prevIdx]
+            let prevX = prev[prevK] ?? 0
             let prevY = prevX - prevK
 
-            // Diagonal moves (equal lines) — walk backwards
             while x > max(prevX, 0) && y > max(prevY, 0) && x > 0 && y > 0 {
                 x -= 1; y -= 1
                 edits.append(.equal(oldIdx: x, newIdx: y))
             }
 
-            // The actual edit
             if fromInsert {
                 if y > 0 { y -= 1; edits.append(.insert(newIdx: y)) }
             } else {
@@ -137,7 +132,6 @@ enum LineDiffer {
             }
         }
 
-        // Remaining diagonal at d=0
         while x > 0 && y > 0 {
             x -= 1; y -= 1
             edits.append(.equal(oldIdx: x, newIdx: y))

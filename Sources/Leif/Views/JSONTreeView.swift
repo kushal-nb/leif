@@ -267,12 +267,16 @@ struct LogDetailView: View {
     @State private var totalMatches = 0        // cached, recomputed only on actual input change
     @Environment(\.colorScheme) var colorScheme
 
-    @State private var treeNodes:         [JSONNode]          = []
-    @State private var arrayFields:       [ArrayField]        = []
-    @State private var prettyJSON:        String              = ""
-    @State private var highlightedJSON:   NSAttributedString  = NSAttributedString()
-    @State private var isBuilding:        Bool                = false
-    @State private var treeOmittedReason: String?           = nil
+    // Single @State holds the built payload — no duplicate copies of each field.
+    @State private var built: PayloadCache.Built?
+    @State private var isBuilding: Bool = false
+
+    // Convenience accessors — read from the single built struct
+    private var treeNodes:        [JSONNode]         { built?.treeNodes ?? [] }
+    private var arrayFields:      [ArrayField]       { built?.arrayFields ?? [] }
+    private var prettyJSON:       String             { built?.prettyJSON ?? "" }
+    private var highlightedJSON:  NSAttributedString { built?.highlightedJSON ?? NSAttributedString() }
+    private var treeOmittedReason: String?           { built?.treeOmittedReason }
 
     // Count occurrences of searchText in the active text view
     private func countMatches(in text: String) -> Int {
@@ -321,7 +325,7 @@ struct LogDetailView: View {
                 payloadView
             }
         }
-        .onChange(of: entry.id)    { _ in isBuilding = true; tab = .json; matchIndex = 0; totalMatches = 0; treeOmittedReason = nil }
+        .onChange(of: entry.id)    { _ in isBuilding = true; built = nil; tab = .json; matchIndex = 0; totalMatches = 0 }
         .onChange(of: searchText)  { _ in matchIndex = 0; recalcTotalMatches() }
         .onChange(of: tab)         { _ in matchIndex = 0; recalcTotalMatches() }
         .task(id: entry.id) { await buildPayload() }
@@ -330,28 +334,20 @@ struct LogDetailView: View {
     // MARK: - Background build with persistent cache
     private func buildPayload() async {
         // Cache is pre-warmed for all entries after parse — this should almost always be a hit.
-        if let built = cache.get(entry.id) {
-            treeNodes          = built.treeNodes
-            arrayFields        = built.arrayFields
-            prettyJSON         = built.prettyJSON
-            highlightedJSON    = built.highlightedJSON
-            treeOmittedReason  = built.treeOmittedReason
-            isBuilding         = false
+        if let cached = cache.get(entry.id) {
+            built = cached
+            isBuilding = false
             recalcTotalMatches()
             return
         }
 
         // Cache miss (e.g. first-ever click before pre-warm reaches this entry).
-        guard let built = await buildEntryPayload(entry) else { isBuilding = false; return }
+        guard let result = await buildEntryPayload(entry) else { isBuilding = false; return }
         guard !Task.isCancelled else { return }
 
-        cache.set(entry.id, built)
-        treeNodes          = built.treeNodes
-        arrayFields        = built.arrayFields
-        prettyJSON         = built.prettyJSON
-        highlightedJSON    = built.highlightedJSON
-        treeOmittedReason  = built.treeOmittedReason
-        isBuilding         = false
+        cache.set(entry.id, result)
+        built = result
+        isBuilding = false
         recalcTotalMatches()
     }
 
@@ -359,18 +355,18 @@ struct LogDetailView: View {
 
     private var headerBar: some View {
         VStack(spacing: 0) {
-            // Level-colored accent strip
+            // Level-colored accent strip — separates rows from detail
             Rectangle()
-                .fill(entry.level.color.opacity(colorScheme == .dark ? 0.55 : 0.65))
-                .frame(height: 2)
+                .fill(entry.level.color.opacity(colorScheme == .dark ? 0.55 : 0.45))
+                .frame(height: 3)
 
             // Row 1: log meta + message
-            HStack(spacing: 6) {
+            HStack(spacing: 8) {
                 LevelBadge(level: entry.level)
                 if let ts = entry.appTimestamp {
                     Text(ts)
                         .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(.secondary.opacity(0.8))
                         .lineLimit(1)
                 }
                 if let caller = entry.caller {
@@ -378,7 +374,7 @@ struct LogDetailView: View {
                         .font(.system(size: 10, weight: .medium, design: .monospaced))
                         .foregroundColor(colorScheme == .dark
                             ? Color(nsColor: .systemTeal)
-                            : Color(red: 0.0, green: 0.38, blue: 0.48))
+                            : Color(red: 0.0, green: 0.38, blue: 0.48).opacity(0.8))
                         .lineLimit(1)
                 }
                 Text(entry.message)
@@ -388,12 +384,12 @@ struct LogDetailView: View {
                     .textSelection(.enabled)
                 Spacer(minLength: 0)
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
             .background(
                 colorScheme == .dark
                     ? Color.white.opacity(0.04)
-                    : entry.level.color.opacity(0.06)
+                    : entry.level.color.opacity(0.04)
             )
 
             // Row 2: tab bar + search nav + copy (only when payload exists)
@@ -479,10 +475,11 @@ struct LogDetailView: View {
             }
             .frame(maxWidth: .infinity)
         } else {
-            // All tab views stay alive in the ZStack — only opacity + hit-testing change.
-            // This prevents NSTextView from being destroyed and re-laid-out on every tab switch,
-            // which was the main cause of jank when toggling back to JSON/Raw.
-            ZStack {
+            // Only ONE tab view is alive at a time. Previous design used a ZStack
+            // with opacity toggling which kept all 4 views (including 2 NSTextViews
+            // with full text storage + layout managers) alive simultaneously — ~300 MB waste.
+            switch tab {
+            case .tree:
                 ScrollView {
                     if let note = treeOmittedReason {
                         Text(note)
@@ -500,24 +497,19 @@ struct LogDetailView: View {
                         .padding(.bottom, 8)
                     }
                 }
-                .opacity(tab == .tree ? 1 : 0)
-                .allowsHitTesting(tab == .tree)
 
+            case .table:
                 if !arrayFields.isEmpty {
                     TablePayloadView(arrayFields: arrayFields, searchText: searchText)
-                        .opacity(tab == .table ? 1 : 0)
-                        .allowsHitTesting(tab == .table)
                 }
 
+            case .json:
                 SyntaxHighlightedJSONView(attributedText: highlightedJSON,
                                           searchText: searchText, matchIndex: matchIndex)
-                    .opacity(tab == .json ? 1 : 0)
-                    .allowsHitTesting(tab == .json)
 
+            case .raw:
                 ReadOnlyCodeView(text: entry.rawContent,
                                  searchText: searchText, matchIndex: matchIndex)
-                    .opacity(tab == .raw ? 1 : 0)
-                    .allowsHitTesting(tab == .raw)
             }
         }
     }
@@ -611,20 +603,25 @@ private func makeReadOnlyScrollableTextView(richText: Bool = false) -> (NSScroll
 }
 
 /// Tracks whether the base text, search query, or match index changed between updates.
+/// Uses a hash for the base text to avoid storing a multi-MB copy just for change detection.
 final class SearchableTextCoordinator {
-    var lastBase   = ""
-    var lastSearch = ""
-    var lastIndex  = 0
+    var lastBaseHash = 0
+    var lastBaseLen  = 0
+    var lastSearch   = ""
+    var lastIndex    = 0
 
     /// Returns which inputs changed. Resets tracking state as a side-effect.
     func detectChanges(base: String, search: String, index: Int) -> (base: Bool, search: Bool, index: Bool)? {
-        let bc = lastBase   != base
-        let sc = lastSearch != search
-        let ic = lastIndex  != index
+        let bHash = base.hashValue
+        let bLen  = base.count
+        let bc = lastBaseHash != bHash || lastBaseLen != bLen
+        let sc = lastSearch   != search
+        let ic = lastIndex    != index
         guard bc || sc || ic else { return nil }
-        lastBase   = base
-        lastSearch = search
-        lastIndex  = index
+        lastBaseHash = bHash
+        lastBaseLen  = bLen
+        lastSearch   = search
+        lastIndex    = index
         return (bc, sc, ic)
     }
 }
@@ -740,7 +737,7 @@ enum JSONHighlighter {
         let whole = NSRange(text.startIndex..., in: text)
         ms.addAttribute(.font, value: font, range: whole)
         ms.addAttribute(.foregroundColor, value: NSColor.labelColor, range: whole)
-        return ms.copy() as! NSAttributedString
+        return ms
     }
 
     /// Syntax highlight — uses regex for small payloads, fast char-by-char for large ones.
@@ -763,7 +760,7 @@ enum JSONHighlighter {
         apply(stringRegex, color: stringColor, to: ms, in: text)
         apply(keyRegex,    color: keyColor,    to: ms, in: text)
 
-        return ms.copy() as! NSAttributedString
+        return ms
     }
 
     /// Fast O(n) syntax highlighter — single pass, char-by-char, no regex.
@@ -814,7 +811,7 @@ enum JSONHighlighter {
             }
             pos = lineEnd > pos ? lineEnd : len
         }
-        return ms.copy() as! NSAttributedString
+        return ms
     }
 
     private static func colorValueFast(_ ms: NSMutableAttributedString, ns: NSString, s: Int, e: Int) {
@@ -848,7 +845,7 @@ enum JSONHighlighter {
             ms.addAttribute(.foregroundColor, value: NSColor.black, range: found)
             loc = found.location + max(1, found.length)
         }
-        return ms.copy() as! NSAttributedString
+        return ms
     }
 
     private static func apply(_ regex: NSRegularExpression, color: NSColor,

@@ -38,6 +38,7 @@ struct LogListView: View {
                         .font(.system(size: 12))
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(logRowsBackground)
             } else {
                 List(filteredEntries, selection: Binding(
                     get: { selected?.id },
@@ -47,7 +48,9 @@ struct LogListView: View {
                         .tag(entry.id)
                         .contextMenu { diffContextMenu(for: entry) }
                 }
-                .listStyle(.inset(alternatesRowBackgrounds: true))
+                .listStyle(.inset(alternatesRowBackgrounds: false))
+                .scrollContentBackground(.hidden)
+                .background(logRowsBackground)
             }
         }
         // Child `Task` (not `detached`). Cooperative `Task.isCancelled` checks so ⌘Q / teardown can bail quickly.
@@ -78,6 +81,15 @@ struct LogListView: View {
         }
         // Clear diff mark when a completely new parse is loaded
         .onChange(of: entries.first?.id) { _ in diffMarked = nil }
+    }
+
+    // Subtle blue-gray tint for the log rows area (light mode only).
+    // Differentiates the rows from the white paste area and white detail pane.
+    // Warm ochre tint — subtle, matches Grafana's log palette
+    private var logRowsBackground: some View {
+        colorScheme == .light
+            ? Color(nsColor: NSColor(calibratedRed: 0.97, green: 0.95, blue: 0.90, alpha: 1))
+            : Color(nsColor: NSColor(calibratedWhite: 0.11, alpha: 1))
     }
 
     // MARK: - Diff context menu
@@ -242,7 +254,7 @@ struct LogRowView: View {
 
             Text(entry.displayTimestamp)
                 .font(.system(size: 11, design: .monospaced))
-                .foregroundColor(colorScheme == .dark ? .secondary : Color.primary.opacity(0.72))
+                .foregroundColor(colorScheme == .dark ? .secondary : Color.primary.opacity(0.55))
                 .frame(width: 88, alignment: .leading)
                 .lineLimit(1)
 
@@ -251,7 +263,7 @@ struct LogRowView: View {
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundColor(colorScheme == .dark
                         ? Color(nsColor: .systemTeal).opacity(0.85)
-                        : Color(red: 0.0, green: 0.38, blue: 0.48))
+                        : Color(red: 0.0, green: 0.38, blue: 0.48).opacity(0.7))
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
             }
@@ -263,12 +275,12 @@ struct LogRowView: View {
 
             if entry.hasPayload {
                 Image(systemName: "chevron.right")
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary)
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary.opacity(0.4))
             }
         }
-        .padding(.vertical, 3)
-        .padding(.horizontal, 4)
+        .padding(.vertical, 4)
+        .padding(.horizontal, 6)
         .contentShape(Rectangle())
     }
 }

@@ -3,28 +3,38 @@ import AppKit
 
 struct ContentView: View {
     @StateObject private var vm = LogViewModel()
+    @StateObject private var perfMonitor = PerformanceMonitor()
     @State private var wrapInput = false
     @State private var unixEntries: [UnixEntry] = [UnixEntry()]
-    @AppStorage("darkMode") private var darkMode = true
+    @AppStorage("darkMode") private var darkMode = false
     @Environment(\.colorScheme) var colorScheme
 
     private struct UnixEntry: Identifiable {
         let id = UUID()
-        /// Optional reminder of what this Unix time refers to (for you, not converted).
         var note: String = ""
         var input: String = ""
     }
+
+    /// Identifies which Unix converter field is focused: row index + field type.
+    private enum UnixField: Hashable {
+        case note(Int)
+        case input(Int)
+    }
+    @FocusState private var focusedUnixField: UnixField?
+
+    private static let unixFmt: ISO8601DateFormatter = {
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        fmt.timeZone = TimeZone(abbreviation: "UTC")!
+        return fmt
+    }()
 
     private func convertUnix(_ raw: String) -> String? {
         let t = raw.trimmingCharacters(in: .whitespaces)
         guard !t.isEmpty, let value = Double(t), value.isFinite else { return nil }
         let seconds = abs(value) > 1e10 ? value / 1000.0 : value
-        // Reject timestamps outside reasonable range (year 0001 to 9999)
         guard seconds >= -62135596800 && seconds <= 253402300799 else { return nil }
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        fmt.timeZone = TimeZone(abbreviation: "UTC")!
-        return fmt.string(from: Date(timeIntervalSince1970: seconds))
+        return Self.unixFmt.string(from: Date(timeIntervalSince1970: seconds))
     }
 
     var body: some View {
@@ -146,6 +156,7 @@ struct ContentView: View {
                         .foregroundColor(.secondary)
                 }
                 Spacer()
+                PerformanceOverlay(monitor: perfMonitor)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
@@ -278,8 +289,21 @@ struct ContentView: View {
     }
 
     // MARK: - Unix → UTC converter panel
+    //
+    // Keyboard navigation:
+    //   Tab         → next field (Note→Unix→next row Note→...)
+    //   Shift+Tab   → previous field
+    //   Enter       → advance to next field; on last Unix field, adds new row
+
     private var unixConverterPanel: some View {
         VStack(alignment: .leading, spacing: 4) {
+            // Section header
+            Text("Unix \u{2192} UTC")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundColor(.secondary.opacity(0.6))
+                .textCase(.uppercase)
+                .tracking(0.5)
+                .padding(.horizontal, 2)
             ForEach(Array(unixEntries.enumerated()), id: \.element.id) { idx, entry in
                 HStack(spacing: 6) {
                     // Note
@@ -289,9 +313,11 @@ struct ContentView: View {
                             get: { unixEntries[safe: idx]?.note ?? "" },
                             set: { if idx < unixEntries.count { unixEntries[idx].note = $0 } }
                         ))
-                        .textFieldStyle(.plain)
+                        .textFieldStyle(.roundedBorder)
                         .font(.system(size: 11, design: .monospaced))
                         .frame(width: 80)
+                        .focused($focusedUnixField, equals: .note(idx))
+                        .onSubmit { advanceUnixFocus(from: .note(idx)) }
                     }
 
                     // Unix input
@@ -301,9 +327,11 @@ struct ContentView: View {
                             get: { unixEntries[safe: idx]?.input ?? "" },
                             set: { if idx < unixEntries.count { unixEntries[idx].input = $0 } }
                         ))
-                        .textFieldStyle(.plain)
+                        .textFieldStyle(.roundedBorder)
                         .font(.system(size: 11, design: .monospaced))
                         .frame(width: 110)
+                        .focused($focusedUnixField, equals: .input(idx))
+                        .onSubmit { advanceUnixFocus(from: .input(idx)) }
                     }
 
                     Image(systemName: "arrow.right")
@@ -330,8 +358,9 @@ struct ContentView: View {
 
                     if unixEntries.count > 1 {
                         Button {
+                            let removing = entry.id
                             withAnimation(.easeOut(duration: 0.2)) {
-                                unixEntries.removeAll { $0.id == entry.id }
+                                unixEntries.removeAll { $0.id == removing }
                             }
                         } label: {
                             Image(systemName: "minus.circle")
@@ -340,11 +369,7 @@ struct ContentView: View {
                         .buttonStyle(.plain)
                     }
                     if idx == unixEntries.count - 1 {
-                        Button {
-                            withAnimation(.easeOut(duration: 0.2)) {
-                                unixEntries.append(UnixEntry())
-                            }
-                        } label: {
+                        Button { addUnixRow() } label: {
                             Label("Add", systemImage: "plus")
                                 .font(.system(size: 10, weight: .medium))
                         }
@@ -365,6 +390,30 @@ struct ContentView: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    /// Enter advances: Note→Unix→next row Note. On last Unix field, adds a new row.
+    /// Tab/Shift-Tab is handled automatically by .roundedBorder text field style.
+    private func advanceUnixFocus(from current: UnixField) {
+        switch current {
+        case .note(let idx):
+            focusedUnixField = .input(idx)
+        case .input(let idx):
+            if idx + 1 < unixEntries.count {
+                focusedUnixField = .note(idx + 1)
+            } else {
+                addUnixRow()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    focusedUnixField = .note(unixEntries.count - 1)
+                }
+            }
+        }
+    }
+
+    private func addUnixRow() {
+        withAnimation(.easeOut(duration: 0.2)) {
+            unixEntries.append(UnixEntry())
+        }
     }
 }
 

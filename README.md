@@ -15,6 +15,8 @@ A compact macOS menu-bar utility for inspecting Kubernetes/Loki logs. Paste any 
 - **Unix timestamp converter** — convert Unix seconds/milliseconds to UTC (multi-row)
 - **Auto-parse** — parses automatically after pasting; or press `Cmd+Return`
 - **Copy button** — copies pretty JSON or raw line to clipboard
+- **Performance monitor** — real-time memory (footprint + RSS) and CPU in the toolbar
+- **Keyboard navigation** — arrow keys in log list, Tab/Enter flow in Unix converter
 - **Menu bar icon** — lives in the status bar, never clutters the Dock
 
 ## Install
@@ -135,20 +137,21 @@ Sources/Leif/
 ├── Hotkey/
 │   └── HotkeyManager.swift        — Global Ctrl+Shift+Space via Carbon API
 ├── ViewModels/
-│   └── LogViewModel.swift         — State management, LRU payload cache, pre-warming
+│   ├── LogViewModel.swift         — State management, LRU payload cache, pre-warming
+│   └── PerformanceMonitor.swift   — Real-time CPU & memory metrics (phys_footprint + RSS)
 ├── Views/
-│   ├── ContentView.swift          — 3-panel layout, Unix converter
+│   ├── ContentView.swift          — 3-panel layout, Unix converter with keyboard nav
 │   ├── LogListView.swift          — Filtered list, diff marking, context menus
 │   ├── JSONTreeView.swift         — Tree/JSON/Raw tabs, syntax highlighting, search
 │   ├── DiffView.swift             — Side-by-side diff window, scroll sync, navigation
 │   ├── TableDataView.swift        — Array detection, dynamic table, TSV/CSV export
-│   └── RawLogEditor.swift         — NSTextView-based editable input
+│   ├── RawLogEditor.swift         — NSTextView-based editable input
+│   └── PerformanceOverlay.swift   — Toolbar memory/CPU badge with expandable detail
 └── Diff/
-    ├── LineDiffer.swift           — Myers O(ND) line diff with aligned output
-    └── JSONDiffer.swift           — Structural JSON diff with UUID array matching
+    └── LineDiffer.swift           — Myers O(ND) line diff with sparse history
 ```
 
-**15 files, ~4,300 lines. Zero external dependencies** — pure SwiftUI + AppKit.
+**16 files, ~4,000 lines. Zero external dependencies** — pure SwiftUI + AppKit.
 
 ### Data Flow
 
@@ -165,7 +168,7 @@ LogParser.parse()              ← Concurrent parsing (all CPU cores)
     ├─▶ LogListView            ← Filtered display, level badges, diff marking
     │       │
     │       ▼
-    │   PayloadCache           ← LRU (200 entries), background pre-warming
+    │   PayloadCache           ← LRU (20 entries), background pre-warming
     │       │
     │       ▼
     │   LogDetailView          ← Tree / JSON / Raw / Table tabs
@@ -184,7 +187,11 @@ LogParser.parse()              ← Concurrent parsing (all CPU cores)
 |----------|-----------|
 | No external dependencies | Single binary, no version conflicts, simple distribution |
 | Menu bar only (no Dock) | Quick access utility; global hotkey for instant show/hide |
-| LRU payload cache (200) | Pre-warms in background; instant tab switching when clicking rows |
+| LRU payload cache (20) | Pre-warms in background; balances memory vs cache hit rate |
+| Single @State per detail view | One `Built` struct instead of 6 separate @State vars — no duplicate copies |
+| `phys_footprint` memory metric | Same as Activity Monitor; unlike `resident_size`, drops when memory is freed |
+| `Task.detached` for payload build | Cooperates with Swift cancellation (replaced non-cancellable GCD blocks) |
+| Diff window auto-closes on clear | Prevents stale LogEntry refs from holding memory after logs are cleared |
 | Concurrent parsing | Uses all CPU cores via `DispatchQueue.concurrentPerform` |
 | Myers line diff (not structural) | Same algorithm as git/GitHub; correct for any JSON structure including arrays of objects with repeated keys |
 | Fixed 14px line height in diff | Ensures both panels have identical pixel height per row for scroll sync |
@@ -204,17 +211,47 @@ The diff view uses a **line-level diff** (not structural JSON diff) for renderin
 6. **Build** `NSAttributedString` with background colors directly from alignment status
 7. **Scroll sync** uses absolute Y offset (identical row count + fixed line height = perfect alignment)
 
-The structural `JSONDiffer` (with UUID-based array matching) is kept for potential future use but is not used for the diff view rendering.
-
 ### Performance Characteristics
 
 | Scenario | Approach |
 |----------|----------|
 | Parsing 10K+ log lines | Concurrent `DispatchQueue.concurrentPerform` across all cores |
 | Payload > 384 KB | Fast O(n) syntax highlighter instead of 5-pass regex |
-| JSON diff 200K+ lines | Myers with 20K edit cap; `Task.detached` for background processing |
-| Payload cache | LRU with 200 entries; doubly-linked list for O(1) eviction |
+| JSON diff 200K+ lines | Myers with 20K edit cap; sparse history; `Task.detached` background |
+| Payload cache | LRU with 20 entries; doubly-linked list for O(1) eviction |
 | Attributed string | Built once in background; NSTextView renders with non-contiguous layout |
+| Detail tabs | Only active tab's view is alive (switch, not ZStack) — saves ~300 MB |
+| Text change detection | Hash-based comparison in NSViewRepresentable coordinators |
+
+### Memory Management
+
+- **`phys_footprint`** metric (same as Activity Monitor) for accurate real-time display
+- **Diff window cleanup**: clears NSTextView text storage, detaches SwiftUI hosting controller, nils window on next run loop tick, calls `malloc_zone_pressure_relief`
+- **Cancellable tasks**: `Task.detached` replaces `withCheckedContinuation` + GCD for proper cancellation
+- **Single @State**: detail view stores one `Built` struct instead of 6 separate @State copies
+
+## Testing
+
+```bash
+swift run LeifTests
+```
+
+Standalone test suite (no Xcode required). 34 tests across 10 categories:
+
+| Category | Tests | Coverage |
+|----------|-------|----------|
+| CRI Simple | 3 | F-line parsing, timestamps, level detection |
+| CRI Partial | 3 | P+F chunk reconstruction, content joining |
+| Zap Format | 2 | Tab-separated fields, timestamp validation |
+| JSON Parsing | 5 | Objects, arrays, multi-line, string-encoded, empty |
+| Full Logs | 3 | 692-line structure, level distribution, file size |
+| Diff Logic | 5 | Identical/changed/added/removed, 1000-key stress |
+| Search | 3 | Case-insensitive, match counting, length clamping |
+| Table | 3 | Array detection, union keys, TSV/CSV escaping |
+| Copy | 2 | Tab-specific copy, raw fallback |
+| Performance | 5 | Parse speed, CRI reconstruction, JSON parse, pretty-print, memory |
+
+Test fixtures in `Tests/LeifTests/Fixtures/` use real Kubernetes CRI log data.
 
 ## TODO
 

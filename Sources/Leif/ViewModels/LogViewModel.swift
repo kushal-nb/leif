@@ -10,37 +10,42 @@ enum PayloadBuildLimits {
 
 func buildEntryPayload(_ entry: LogEntry) async -> PayloadCache.Built? {
     guard let fields = entry.fields else { return nil }
-    return await withCheckedContinuation { cont in
-        // `.userInitiated` — large payload work is the main thread of user focus; `.background` starves it.
-        DispatchQueue.global(qos: .userInitiated).async {
-            let rawBytes = entry.rawContent.utf8.count
-            let heavy    = rawBytes >= PayloadBuildLimits.heavyRawUTF8
-            let dict     = fields.pairs.reduce(into: [String: Any]()) { $0[$1.key] = $1.value }
+    guard !Task.isCancelled else { return nil }
 
-            let pp = JSONFormatter.prettyPrint(dict)
+    // Task.detached cooperates with Swift cancellation — unlike the previous
+    // withCheckedContinuation + DispatchQueue.global pattern which could not
+    // be cancelled once dispatched.
+    return await Task.detached(priority: .userInitiated) {
+        guard !Task.isCancelled else { return nil as PayloadCache.Built? }
 
-            // highlight() auto-selects: regex for small payloads, fast O(n) char-by-char for large.
-            let hl = JSONHighlighter.highlight(pp)
+        let rawBytes = entry.rawContent.utf8.count
+        let heavy    = rawBytes >= PayloadBuildLimits.heavyRawUTF8
+        let dict     = fields.pairs.reduce(into: [String: Any]()) { $0[$1.key] = $1.value }
 
-            let nodes: [JSONNode]
-            let treeNote: String?
-            if heavy {
-                nodes = []
-                let kb = rawBytes / 1024
-                treeNote = "Tree view is disabled for large payloads (~\(kb) KB). Use the JSON or Raw tab."
-            } else {
-                nodes = dict.keys.sorted().map { k in JSONNode.build(from: dict[k]!, key: k) }
-                treeNote = nil
-            }
+        let pp = JSONFormatter.prettyPrint(dict)
+        guard !Task.isCancelled else { return nil }
 
-            let af = extractArrayFields(from: OrderedFields(dict), maxRecursionDepth: heavy ? 3 : 64)
+        let hl = JSONHighlighter.highlight(pp)
+        guard !Task.isCancelled else { return nil }
 
-            cont.resume(returning: PayloadCache.Built(
-                treeNodes: nodes, arrayFields: af, prettyJSON: pp, highlightedJSON: hl,
-                treeOmittedReason: treeNote
-            ))
+        let nodes: [JSONNode]
+        let treeNote: String?
+        if heavy {
+            nodes = []
+            let kb = rawBytes / 1024
+            treeNote = "Tree view is disabled for large payloads (~\(kb) KB). Use the JSON or Raw tab."
+        } else {
+            nodes = dict.keys.sorted().map { k in JSONNode.build(from: dict[k]!, key: k) }
+            treeNote = nil
         }
-    }
+
+        let af = extractArrayFields(from: OrderedFields(dict), maxRecursionDepth: heavy ? 3 : 64)
+
+        return PayloadCache.Built(
+            treeNodes: nodes, arrayFields: af, highlightedJSON: hl,
+            treeOmittedReason: treeNote
+        )
+    }.value
 }
 
 // MARK: - Payload cache  (LRU, capped to avoid unbounded memory growth)
@@ -48,13 +53,15 @@ final class PayloadCache {
     struct Built {
         let treeNodes:           [JSONNode]
         let arrayFields:         [ArrayField]
-        let prettyJSON:          String
         let highlightedJSON:     NSAttributedString
         /// Non-nil when the tree tab shows a hint instead of materializing a huge SwiftUI tree.
         let treeOmittedReason:   String?
+
+        /// Derived from highlightedJSON — no extra allocation.
+        var prettyJSON: String { highlightedJSON.string }
     }
 
-    private static let maxEntries = 200
+    private static let maxEntries = 20
     private let lock = NSLock()
     private var store: [UUID: Built] = [:]
     /// Doubly-linked list node for O(1) LRU tracking.
@@ -99,6 +106,12 @@ final class PayloadCache {
             nodeMap[id] = node
         }
         store[id] = built
+    }
+
+    var storeCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return store.count
     }
 
     func clear() {
@@ -155,16 +168,11 @@ final class LogViewModel: ObservableObject {
     func parse() {
         let text = rawText
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        // Skip re-parse if text is identical to last parse
         if text == lastParsedText && !entries.isEmpty { return }
         lastParsedText = text
 
-        parseTask?.cancel()
-        prewarmTask?.cancel()
-        // Clear old state completely before starting fresh
-        payloadCache.clear()
-        selectedEntry = nil
-        entries = []
+        // Reset parsed state before new parse (but keep rawText — user's input stays)
+        teardownParsedState()
         isParsingBusy = true
 
         parseTask = Task {
@@ -181,13 +189,30 @@ final class LogViewModel: ObservableObject {
     }
 
     func clear() {
+        teardownParsedState()
+        rawText = ""
+        lastParsedText = ""
+    }
+
+    // MARK: - Centralized cleanup
+    //
+    // Clears all PARSED state: entries, cache, tasks, diff window.
+    // Does NOT touch rawText (parse() needs it; clear() handles rawText separately).
+
+    private func teardownParsedState() {
+        // 1. Cancel all background work
         parseTask?.cancel()
         prewarmTask?.cancel()
-        rawText = ""
+        parseTask = nil
+        prewarmTask = nil
+
+        // 2. Clear parsed data
         entries = []
         selectedEntry = nil
-        lastParsedText = ""
         payloadCache.clear()
+
+        // 3. Close diff window — releases LogEntry refs + NSTextViews
+        DiffWindowController.shared.closeIfOpen()
     }
 
     // Builds every entry's payload at background priority.

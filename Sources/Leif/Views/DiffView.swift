@@ -15,35 +15,74 @@ private final class EscapeClosingWindow: NSWindow {
 final class DiffWindowController: NSObject, NSWindowDelegate {
     static let shared = DiffWindowController()
     private var window: NSWindow?
+    /// Saved frame so the next diff window reopens at the same position/size.
+    private var lastFrame: NSRect?
 
     func show(left: LogEntry, right: LogEntry, isDark: Bool) {
+        // Clean up any existing diff window first — prevents leaking the old one
+        if window != nil { closeIfOpen() }
+
         let hosting = NSHostingController(rootView: DiffView(left: left, right: right))
         hosting.sizingOptions = []
-        if window == nil {
-            let win = EscapeClosingWindow(contentViewController: hosting)
-            win.title = "JSON Diff"
-            win.styleMask = [.titled, .closable, .resizable, .miniaturizable]
-            win.isReleasedWhenClosed = false
-            win.delegate = self
-            win.minSize = NSSize(width: 900, height: 560)
+        let win = EscapeClosingWindow(contentViewController: hosting)
+        win.title = "JSON Diff"
+        win.styleMask = [.titled, .closable, .resizable, .miniaturizable]
+        win.isReleasedWhenClosed = false
+        win.delegate = self
+        win.minSize = NSSize(width: 900, height: 560)
+        if let frame = lastFrame {
+            win.setFrame(frame, display: false)
+        } else {
             let avail = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
                         ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
             let w = max(900, min(1480, avail.width * 0.82)).rounded()
             let h = max(560, min(960, avail.height * 0.82)).rounded()
             win.setContentSize(NSSize(width: w, height: h))
             win.center()
-            self.window = win
-        } else { window!.contentViewController = hosting }
-        guard let win = window else { return }
+        }
+        self.window = win
         win.appearance = NSAppearance(named: isDark ? .darkAqua : .aqua)
         win.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    /// Free diff data when window is closed — the attributed strings and aligned lines
-    /// can be large (200K+ lines). Replace with an empty view to release them.
+    /// Free ALL diff memory when window is closed (✕ button, Cmd+W, or Esc).
     func windowWillClose(_ notification: Notification) {
-        window?.contentViewController = NSHostingController(rootView: EmptyView())
+        guard let win = window else { return }
+        lastFrame = win.frame
+
+        // 1. Clear NSTextView textStorage — releases the huge NSAttributedStrings
+        //    and their layout managers.
+        clearTextViews(in: win.contentView)
+
+        // 2. Detach the SwiftUI hosting controller — releases DiffView,
+        //    DiffResult, and all SwiftUI state.
+        win.contentViewController = nil
+
+        // 3. Drop window ref on the NEXT run loop tick so AppKit's close
+        //    animation finishes before ARC deallocs the window.
+        DispatchQueue.main.async { [weak self] in
+            self?.window = nil
+
+            // 4. Force malloc to return freed pages to the OS.
+            //    Without this, resident_size stays high even though objects are freed
+            //    because malloc keeps pages mapped for reuse.
+            malloc_zone_pressure_relief(nil, 0)
+        }
+    }
+
+    /// Programmatically close the diff window (e.g. when the main app clears logs).
+    func closeIfOpen() {
+        window?.close()  // triggers windowWillClose → full cleanup
+    }
+
+    /// Recursively find all NSTextViews and clear their storage.
+    private func clearTextViews(in view: NSView?) {
+        guard let view else { return }
+        if let tv = view as? NSTextView {
+            tv.textStorage?.setAttributedString(NSAttributedString())
+        }
+        for sub in view.subviews { clearTextViews(in: sub) }
     }
 }
 
@@ -71,6 +110,7 @@ struct DiffView: View {
     @State private var diffState = DiffState.computing
     @State private var syncCoordinator = ScrollSyncCoordinator()
     @State private var currentChange = 0
+    @State private var diffTask: Task<DiffResult?, Never>?
     @Environment(\.colorScheme) var cs
 
     var body: some View {
@@ -141,20 +181,30 @@ struct DiffView: View {
             Text(summary).font(.system(size: 10)).foregroundColor(.secondary).lineLimit(1)
             Spacer(minLength: 0)
             if changeCount > 0 {
-                HStack(spacing: 3) {
+                HStack(spacing: 2) {
                     Button(action: { navigateChange(delta: -1) }) {
-                        Image(systemName: "chevron.up").font(.system(size: 9, weight: .bold))
-                    }.buttonStyle(.plain).foregroundColor(.secondary).help("Previous change (Cmd+Up)")
+                        Image(systemName: "arrowtriangle.up.fill")
+                            .font(.system(size: 8))
+                            .frame(width: 26, height: 22)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Previous change (Cmd+Up)")
+
                     Text("\(min(currentChange + 1, changeCount))/\(changeCount)")
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundColor(.primary).frame(minWidth: 36)
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.primary)
+                        .frame(minWidth: 36)
+
                     Button(action: { navigateChange(delta: 1) }) {
-                        Image(systemName: "chevron.down").font(.system(size: 9, weight: .bold))
-                    }.buttonStyle(.plain).foregroundColor(.secondary).help("Next change (Cmd+Down)")
+                        Image(systemName: "arrowtriangle.down.fill")
+                            .font(.system(size: 8))
+                            .frame(width: 26, height: 22)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Next change (Cmd+Down)")
                 }
-                .padding(.horizontal, 6).padding(.vertical, 3)
-                .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color(nsColor: .controlBackgroundColor)))
-                .overlay(RoundedRectangle(cornerRadius: 5, style: .continuous).stroke(Color(nsColor: .separatorColor), lineWidth: 0.5))
             }
             Text("Cmd+F search  |  Esc close").font(.system(size: 10)).foregroundColor(.secondary.opacity(0.45))
         }.padding(.horizontal, 12).padding(.vertical, 6).background(Color(nsColor: .controlBackgroundColor).opacity(0.7))
@@ -183,21 +233,29 @@ struct DiffView: View {
     // MARK: Compute diff — all heavy work in background
 
     private func computeDiff() async {
+        // Cancel any previous in-flight diff computation
+        diffTask?.cancel()
+
         guard let lf = left.fields, let rf = right.fields else { diffState = .noPayload; return }
         let lDict = Dictionary(uniqueKeysWithValues: lf.pairs.map { ($0.key, $0.value) })
         let rDict = Dictionary(uniqueKeysWithValues: rf.pairs.map { ($0.key, $0.value) })
         if (lDict as NSDictionary).isEqual(to: rDict as NSDictionary) { diffState = .identical; return }
 
         let isDark = cs == .dark
-        let result = await Task.detached(priority: .userInitiated) { () -> DiffResult? in
+        let task = Task.detached(priority: .userInitiated) { () -> DiffResult? in
             // Pretty-print both sides
             let leftJSON = JSONFormatter.prettyPrint(lDict)
             let rightJSON = JSONFormatter.prettyPrint(rDict)
+
+            // Check cancellation after heavy work
+            if Task.isCancelled { return nil }
+
             let leftLines = leftJSON.components(separatedBy: "\n")
             let rightLines = rightJSON.components(separatedBy: "\n")
 
             // Line-level diff (Myers) → aligned output
             let aligned = LineDiffer.diff(left: leftLines, right: rightLines)
+            if Task.isCancelled { return nil }
             if aligned.allSatisfy({ $0.status == .context }) { return nil }
 
             // Summary
@@ -223,12 +281,18 @@ struct DiffView: View {
                 }
             }
 
+            if Task.isCancelled { return nil }
+
             // Build attributed strings
             let la = DiffAttrBuilder.build(aligned: aligned, isLeft: true, isDark: isDark)
+            if Task.isCancelled { return nil }
             let ra = DiffAttrBuilder.build(aligned: aligned, isLeft: false, isDark: isDark)
 
             return DiffResult(leftAttr: la, rightAttr: ra, summary: summary, changeIndices: changeIndices)
-        }.value
+        }
+        diffTask = task
+
+        let result = await task.value
 
         guard !Task.isCancelled else { return }
         if let result {
@@ -320,7 +384,9 @@ private enum DiffAttrBuilder {
             pos = lineEnd; rowIdx += 1
         }
 
-        return result.copy() as! NSAttributedString
+        // Return mutable directly — DiffTextView only reads, no need for an immutable copy
+        // that doubles memory.
+        return result
     }
 
     // MARK: Diff colors
@@ -379,8 +445,8 @@ private enum DiffAttrBuilder {
 // MARK: - Scroll sync coordinator
 
 final class ScrollSyncCoordinator {
-    var leftScroll: NSScrollView?; var rightScroll: NSScrollView?
-    var leftTV: NSTextView?; var rightTV: NSTextView?
+    weak var leftScroll: NSScrollView?; weak var rightScroll: NSScrollView?
+    weak var leftTV: NSTextView?; weak var rightTV: NSTextView?
     private var isSyncing = false
 
     /// Both panels have identical line counts → sync by absolute Y offset.

@@ -8,6 +8,10 @@ let package = Package(
         .executableTarget(
             name: "Leif",
             path: "Sources/Leif"
+        ),
+        .executableTarget(
+            name: "LeifTests",
+            path: "Tests/LeifTests"
         )
     ]
 )
